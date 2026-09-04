@@ -64,7 +64,6 @@ Step "完成"
 Write-Host @"
 公开仓：$Public（HEAD = $((git -C $Public rev-parse --short HEAD))）
 溯源：私有仓 $srcHash（$srcDate）
-下一步（首次手动）：
-  git -C $Public remote add origin <你的GitHub仓库URL>
-  git -C $Public push -u origin main
+推 GitHub：git -C $Public push
+（远端已配置：https://github.com/zyl-123456/affairmate.git）
 "@ -ForegroundColor Green
