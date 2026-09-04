@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 秘密与环境
+*.keystore
+*.jks
+!debug.keystore
+*.env
+*.pem
+*.key
+secrets/
+
+# 日志与数据产物
+*.log
+logs/
+outputs/tmp/
+
+# 构建产物
+build/
+dist/
+*.apk
+*.aab
+
+# IDE / 系统
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Flutter/Dart 构建与工具缓存
+.dart_tool/
+*.dill
+ephemeral/
