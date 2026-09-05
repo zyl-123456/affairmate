@@ -250,8 +250,81 @@ void main() {
     expect(repo.loadState(), isEmpty);
   });
 
-  group('M-013 mergeSchedule（安排合并语义）', () {
-    const am = ScheduleBlock(start: '09:00', end: '11:00', matterRef: '上午事');
+  group('M-034 多轨日程', () {
+    test('异轨不冲突：重排主轨不动伴随轨', () {
+      final old = [
+        const ScheduleBlock(start: '14:00', end: '16:00', matterRef: 'AI 开发'),
+        const ScheduleBlock(start: '14:00', end: '16:00', matterRef: '背单词', track: 1),
+      ];
+      // 重排主轨同时段
+      final incoming = [
+        const ScheduleBlock(start: '14:00', end: '16:00', matterRef: '写论文'),
+      ];
+      final merged = AppState.mergeSchedule(old, incoming);
+      expect(merged.length, 2, reason: '主轨被替换（1条新）+伴随轨保留（背单词）');
+      expect(merged.where((b) => b.matterRef == '背单词').first.track, 1);
+      expect(merged.where((b) => b.matterRef == '背单词').length, 1);
+      expect(merged.where((b) => b.matterRef == '写论文').length, 1);
+      expect(merged.where((b) => b.matterRef == 'AI 开发').length, 0, reason: '旧主轨被同轨重叠替换');
+    });
+
+    test('track 字段解析兼容：无 track 字段=主轨；字符串数字也能解析', () {
+      final b1 = ScheduleBlock.fromJson({'start': '09:00', 'end': '10:00', 'matter_ref': '旧数据'});
+      expect(b1.track, 0, reason: '旧数据无 track → 主轨');
+      final b2 = ScheduleBlock.fromJson({'start': '09:00', 'end': '10:00', 'matter_ref': 'x', 'track': '2'});
+      expect(b2.track, 2, reason: '字符串数字容错');
+      expect(b2.isParallel, isTrue);
+      expect(b1.toJson().containsKey('track'), isFalse, reason: '主轨不写 track 字段（省空间）');
+      expect(b2.toJson()['track'], 2);
+    });
+
+    test('三轨并存：主+两伴随同起点排序主轨在前', () {
+      final blocks = [
+        const ScheduleBlock(start: '14:00', end: '16:00', matterRef: '伴随2', track: 2),
+        const ScheduleBlock(start: '14:00', end: '16:00', matterRef: '主'),
+        const ScheduleBlock(start: '14:00', end: '16:00', matterRef: '伴随1', track: 1),
+      ];
+      final merged = AppState.mergeSchedule(const [], blocks);
+      expect(merged.first.matterRef, '主', reason: '同起点主轨排最前');
+    });
+  });
+
+  group('M-035 时间空洞', () {
+    test('主轨未覆盖时段成洞；伴随轨不算覆盖', () {
+      final blocks = [
+        const ScheduleBlock(start: '09:00', end: '10:00', matterRef: 'A'),
+        const ScheduleBlock(start: '10:30', end: '12:00', matterRef: 'B'),
+        const ScheduleBlock(start: '10:30', end: '12:00', matterRef: '背单词', track: 1),
+      ];
+      final gaps = AppState.uncoveredGaps(blocks, minMinutes: 15);
+      // 洞：0:00-9:00（若from=0）、10:00-10:30、12:00-24:00；伴随轨不影响
+      expect(gaps.contains((600, 630)), isTrue, reason: '10:00-10:30 的 30 分钟洞');
+      final morning = gaps.where((g) => g.$1 == 0).toList();
+      expect(morning, isNotEmpty, reason: '清晨未覆盖也是洞');
+    });
+
+    test('阈值过滤：15 分钟以下的洞不算', () {
+      final blocks = [
+        const ScheduleBlock(start: '09:00', end: '10:00', matterRef: 'A'),
+        const ScheduleBlock(start: '10:10', end: '11:00', matterRef: 'B'), // 10 分钟缝
+      ];
+      final gaps = AppState.uncoveredGaps(blocks, fromMinute: 9 * 60, toMinute: 11 * 60, minMinutes: 15);
+      expect(gaps.where((g) => g.$1 == 600), isEmpty, reason: '10 分钟小缝被阈值过滤');
+    });
+
+    test('指定区间扫描：只看 8 点到现在', () {
+      final blocks = [
+        const ScheduleBlock(start: '09:00', end: '18:00', matterRef: '全天'),
+      ];
+      // 8:00-20:00 区间 → 洞只有 8:00-9:00 和 18:00-20:00，不含深夜
+      final gaps = AppState.uncoveredGaps(blocks, fromMinute: 8 * 60, toMinute: 20 * 60, minMinutes: 15);
+      expect(gaps.length, 2);
+      expect(gaps.first, (480, 540));
+      expect(gaps.last, (1080, 1200));
+    });
+  });
+
+  group('M-013 mergeSchedule（安排合并语义）', () {    const am = ScheduleBlock(start: '09:00', end: '11:00', matterRef: '上午事');
     const pm = ScheduleBlock(start: '14:00', end: '16:00', matterRef: '下午事');
 
     test('非重叠新块：旧块全保留，按时序排序', () {

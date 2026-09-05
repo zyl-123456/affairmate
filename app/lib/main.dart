@@ -1,12 +1,17 @@
 // 主入口与双模式界面 · 事务伴侣
 // 对应设计：D-006（双模式切换即两个页面，共享同一会话状态）
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'app_state_scope.dart';
 import 'data/repo.dart';
+import 'llm/notify.dart';
+import 'llm/sprite.dart';
 import 'llm/voice.dart';
+import 'pages/playbook_page.dart';
 import 'pages/timeline_page.dart';
 import 'pages/settings_page.dart';
 import 'state.dart';
@@ -89,17 +94,88 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int _tab = 0;
   final _input = TextEditingController();
   final _voice = VoiceInput();
   final _chatScroll = ScrollController();
   int _lastChatLen = 0; // 用于侦测新消息滚底（M-012）
 
+  // M-035 补账提醒：侦测今天已过时段的时间空洞，超阈值弹页顶提醒条。
+  // 节流口径：同一"洞结束时刻"只提醒一次（用户补录/调整后自然消停）。
+  Timer? _gapTimer;
+  int? _lastNudgedGapEnd;
+  bool _gapNudgeShown = false;
+
+  // M-036 复盘横幅：到周期+数据够 → 问一次；拒绝后 7 天内不再问
+  bool _reviewBannerShown = false;
+  DateTime? _reviewDeclinedAt;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // M-037a 前后台侦测
+    NotifyService.init(); // 通知初始化（安卓）
+    NotifyService.onTapNavigate = (mode) {
+      // 点通知跳对应会话页（App 可能冷启动，navigate 回调在 build 后消费）
+      if (!mounted) return;
+      setState(() => _tab = mode == 'arrange' ? 1 : 0);
+    };
+    // M-037b：精灵初始化 + 转写文本 → 复用完整发送链路
+    SpriteController.init();
+    SpriteController.onSpriteMessage = (text, arrange) {
+      final app = InheritedAppState.maybeOf(context);
+      app?.send(text, arrangeMode: arrange);
+    };
     _voice.addListener(() => setState(() {})); // 语音状态变化刷新输入区
+    _gapTimer = Timer.periodic(const Duration(minutes: 2), (_) {
+      if (!mounted) return;
+      final app = InheritedAppState.maybeOf(context);
+      if (app == null) return;
+      _checkGaps(app);
+    });
+    // M-036：启动即查复盘点（老大 00:09 裁决：复盘汇报要弹通知=横幅提示）
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final app = InheritedAppState.maybeOf(context);
+      if (app == null || !app.dueForReview) return;
+      final declinedRecently = _reviewDeclinedAt != null &&
+          DateTime.now().difference(_reviewDeclinedAt!).inDays < 7;
+      if (!declinedRecently) setState(() => _reviewBannerShown = true);
+    });
+  }
+
+  void _checkGaps(AppState app) {
+    final now = DateTime.now();
+    final nowMin = now.hour * 60 + now.minute;
+    // 8 点起床口径到当前时间，未覆盖 ≥45 分钟才提醒（避免碎片误扰）
+    final gaps = AppState.uncoveredGaps(app.schedule,
+        fromMinute: 8 * 60, toMinute: nowMin, minMinutes: 45);
+    if (gaps.isEmpty) {
+      if (_gapNudgeShown) setState(() => _gapNudgeShown = false);
+      return;
+    }
+    final gapEnd = gaps.last.$2;
+    if (gapEnd == _lastNudgedGapEnd) return; // 这个洞已提醒过
+    _lastNudgedGapEnd = gapEnd;
+    setState(() => _gapNudgeShown = true);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _gapTimer?.cancel();
+    _input.dispose();
+    _voice.dispose();
+    _chatScroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // M-037a：后台标记——后台收到的回复才弹系统通知（前台不打扰）
+    NotifyService.appInBackground =
+        state == AppLifecycleState.paused || state == AppLifecycleState.hidden;
   }
 
   /// 聊天有新消息时滚到底部（M-012：回复不再跑到屏幕外）
@@ -115,33 +191,30 @@ class _HomePageState extends State<HomePage> {
   }
 
   @override
-  void dispose() {
-    _input.dispose();
-    _voice.dispose();
-    _chatScroll.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
     final app = InheritedAppState.of(context);
+    final scheme = Theme.of(context).colorScheme; // M-035 提醒条配色
     final tabs = [
       ('沟通', Icons.chat_bubble_outline),
       ('安排', Icons.event_note_outlined),
       ('展示', Icons.view_timeline_outlined),
+      ('懂我', Icons.auto_stories_outlined), // M-032 个人说明书页（REQ-014）
     ];
 
     return AnimatedBuilder(
       animation: app,
       builder: (context, _) {
-        final chatLen = app.chat.length;
+        // 双模式独立会话（M-024）：当前模式的会话才参与滚底侦测与渲染
+        final session = _tab == 1 ? app.chatArrange : app.chatChat;
+        final chatLen = session.length;
         if (chatLen != _lastChatLen) {
           _lastChatLen = chatLen;
           _scrollChatToBottom(app); // 新消息（含 AI 回复）自动滚底
         }
+        final isChatTab = _tab == 0 || _tab == 1;
         return Scaffold(
           appBar: AppBar(
-            title: Text('事务伴侣 · ${tabs[_tab].$1}模式'),
+            title: Text(isChatTab ? '事务伴侣 · ${tabs[_tab].$1}模式' : '事务伴侣 · ${tabs[_tab].$1}'),
             actions: [
               IconButton(
                 icon: const Icon(Icons.settings_outlined),
@@ -153,9 +226,72 @@ class _HomePageState extends State<HomePage> {
               ),
             ],
           ),
-          body: _tab == 2
-              ? TimelinePage(app: app)
-              : _buildChat(app, arrangeMode: _tab == 1),
+          body: Column(
+            children: [
+              // M-036 复盘邀请横幅：到周期+数据够时置顶询问（花 token 须老大点头）
+              if (_reviewBannerShown)
+                Material(
+                  color: scheme.primaryContainer,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    child: Row(children: [
+                      Icon(Icons.auto_awesome, size: 16, color: scheme.onPrimaryContainer),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '用了一阵子啦——要让我复盘一下最近的你吗？我会翻翻这阵子的状态和日程，更新「懂我」说明书。',
+                          style: TextStyle(fontSize: 12, color: scheme.onPrimaryContainer, height: 1.3),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () async {
+                          setState(() => _reviewBannerShown = false);
+                          await app.runReview();
+                        },
+                        child: const Text('现在复盘', style: TextStyle(fontSize: 12)),
+                      ),
+                      TextButton(
+                        onPressed: () => setState(() {
+                          _reviewBannerShown = false;
+                          _reviewDeclinedAt = DateTime.now(); // 7 天后再问
+                        }),
+                        child: const Text('先不用', style: TextStyle(fontSize: 12)),
+                      ),
+                    ]),
+                  ),
+                ),
+              // M-035 补账提醒条：今天有大段未记录时间时置顶提示
+              if (_gapNudgeShown)
+                Material(
+                  color: scheme.errorContainer,
+                  child: InkWell(
+                    onTap: () => setState(() => _gapNudgeShown = false), // 点掉稍后再说
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      child: Row(children: [
+                        Icon(Icons.notifications_active_outlined,
+                            size: 16, color: scheme.onError),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '有段时间还没记录哦——刚才在忙什么？去沟通页告诉它，哪怕是在休息。',
+                            style: TextStyle(fontSize: 12, color: scheme.onError, height: 1.3),
+                          ),
+                        ),
+                        Icon(Icons.close, size: 14, color: scheme.onError),
+                      ]),
+                    ),
+                  ),
+                ),
+              Expanded(
+                child: switch (_tab) {
+                  2 => TimelinePage(app: app),
+                  3 => const PlaybookPage(), // M-032 懂我页
+                  _ => _buildChat(app, arrangeMode: _tab == 1),
+                },
+              ),
+            ],
+          ),
           bottomNavigationBar: NavigationBar(
             selectedIndex: _tab,
             onDestinationSelected: (i) => setState(() => _tab = i),
@@ -170,10 +306,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildChat(AppState app, {required bool arrangeMode}) {
+    final session = arrangeMode ? app.chatArrange : app.chatChat;
     return Column(
       children: [
         Expanded(
-          child: app.chat.isEmpty
+          child: session.isEmpty
               ? Center(
                   child: Text(
                     arrangeMode
@@ -186,8 +323,8 @@ class _HomePageState extends State<HomePage> {
               : ListView.builder(
                   controller: _chatScroll,
                   padding: const EdgeInsets.all(12),
-                  itemCount: app.chat.length,
-                  itemBuilder: (_, i) => _bubble(context, app.chat[i]),
+                  itemCount: session.length,
+                  itemBuilder: (_, i) => _bubble(context, session[i]),
                 ),
         ),
         if (app.sending)
@@ -253,37 +390,54 @@ class _HomePageState extends State<HomePage> {
   // ============ 语音输入（D-005：按住说话，松开自动发送）============
 
   String _voiceHint(bool arrangeMode) {
-    if (_voice.state == VoiceState.listening) {
-      return _voice.partialText.isEmpty ? '在听…说话吧' : _voice.partialText;
+    if (_voice.state == VoiceState.listening) return '在听…再点一下麦克风结束';
+    if (_voice.state == VoiceState.finalizing) return '转写中…（云端识别）';
+    if (_voice.state == VoiceState.unavailable) {
+      return _voice.lastError.isEmpty
+          ? (arrangeMode ? '想怎么安排？（语音不可用）' : '说点什么…（语音不可用）')
+          : _voice.lastError; // 具体失败原因直接亮给用户（M-026：不静默吞）
     }
-    if (_voice.state == VoiceState.unavailable) return arrangeMode ? '想怎么安排？（语音不可用）' : '说点什么…（语音不可用）';
     return arrangeMode ? '想怎么安排？' : '说点什么…';
   }
 
   Widget _micButton(AppState app, bool arrangeMode) {
+    // M-030 点击式语音（老大 2026-09-05）：点一下开始，再点一下停止发送——
+    // 替代长按式（手指一直摁着累）。录音中图标变实心+红底，一眼可辨状态。
     final listening = _voice.isListening;
+    final finalizing = _voice.state == VoiceState.finalizing;
     final scheme = Theme.of(context).colorScheme;
     return GestureDetector(
-      onLongPressStart: (_) => _voice.start(),
-      onLongPressEnd: (_) async {
-        final text = await _voice.stop();
-        if (text.isNotEmpty && !app.sending) {
-          app.send(text, arrangeMode: arrangeMode);
-        }
-      },
-      onLongPressCancel: () => _voice.cancel(),
+      onTap: finalizing
+          ? null // 转写中不可重复触发
+          : () async {
+              if (listening) {
+                final text = await _voice.stop();
+                if (text.isNotEmpty && !app.sending) {
+                  app.send(text, arrangeMode: arrangeMode);
+                }
+              } else {
+                await _voice.start();
+              }
+            },
       child: Container(
         width: 44,
         height: 44,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          color: listening ? scheme.errorContainer : scheme.surfaceContainerHighest,
+          color: listening
+              ? scheme.errorContainer
+              : scheme.surfaceContainerHighest,
         ),
-        child: Icon(
-          listening ? Icons.mic : Icons.mic_none,
-          color: listening ? scheme.onError : scheme.onSurfaceVariant,
-          size: 22,
-        ),
+        child: finalizing
+            ? const Padding(
+                padding: EdgeInsets.all(14),
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : Icon(
+                listening ? Icons.mic : Icons.mic_none,
+                color: listening ? scheme.onError : scheme.onSurfaceVariant,
+                size: 22,
+              ),
       ),
     );
   }

@@ -5,29 +5,46 @@ import 'dart:convert';
 
 // ============ 事项知识库 ============
 
-/// 事项内核三属性（内核层，固定）
+/// 事项内核属性（内核层，固定）
 class CoreAttrs {
   final String timeReq; // 时间要求（含截止日、耗时，自然语言，如"下周三截止，约需2小时"）
   final String energyReq; // 精力要求（如"高认知"）
   final bool exclusive; // 独占性：能否与其他事并行
+  final String mastery; // 掌握度（REQ-013）：familiar 熟 / average 一般 / unfamiliar 生疏
 
   const CoreAttrs({
     this.timeReq = '',
     this.energyReq = '',
     this.exclusive = false,
+    this.mastery = '',
   });
 
   factory CoreAttrs.fromJson(Map<String, dynamic> j) => CoreAttrs(
         timeReq: (j['time_req'] ?? '').toString(),
         energyReq: (j['energy_req'] ?? '').toString(),
         exclusive: j['exclusive'] == true || j['exclusive'] == 1,
+        mastery: (j['mastery'] ?? '').toString(),
       );
 
   Map<String, dynamic> toJson() => {
         'time_req': timeReq,
         'energy_req': energyReq,
         'exclusive': exclusive,
+        if (mastery.isNotEmpty) 'mastery': mastery,
       };
+
+  CoreAttrs copyWith({
+    String? timeReq,
+    String? energyReq,
+    bool? exclusive,
+    String? mastery,
+  }) =>
+      CoreAttrs(
+        timeReq: timeReq ?? this.timeReq,
+        energyReq: energyReq ?? this.energyReq,
+        exclusive: exclusive ?? this.exclusive,
+        mastery: mastery ?? this.mastery,
+      );
 }
 
 /// 单条事项（on/off 开关 + 两层属性）
@@ -188,6 +205,128 @@ class StateDay {
         'emotion': emotion.toJson(),
         'motivation': motivation.toJson(),
       };
+
+  /// 测试辅助：改日期（M-036 e2e 造多天数据用）
+  StateDay copyWithDate(String newDate) => StateDay(
+        date: newDate,
+        body: body,
+        cognition: cognition,
+        emotion: emotion,
+        motivation: motivation,
+      );
+}
+
+// ============ 个人说明书（底色层，REQ-012 / M-032）============
+
+/// 说明书单条记录：内容 + 依据 + 可信度 + 来源 + 时间
+class ProfileEntry {
+  final String content; // 一句话结论（如"轻度运动15分钟能恢复认知疲劳"）
+  final String evidence; // 依据（如"近14天有11天运动后认知回升"）
+  final String confidence; // high / medium / low
+  final String origin; // user=亲述 / ai=观察提炼 / review=复盘重写
+  final String updatedAt; // ISO 时间
+
+  const ProfileEntry({
+    required this.content,
+    this.evidence = '',
+    this.confidence = 'medium',
+    this.origin = 'ai',
+    this.updatedAt = '',
+  });
+
+  factory ProfileEntry.fromJson(Map<String, dynamic> j) => ProfileEntry(
+        content: (j['content'] ?? '').toString(),
+        evidence: (j['evidence'] ?? '').toString(),
+        confidence: (j['confidence'] ?? 'medium').toString(),
+        origin: (j['origin'] ?? 'ai').toString(),
+        updatedAt: (j['updated_at'] ?? '').toString(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'content': content,
+        'evidence': evidence,
+        'confidence': confidence,
+        'origin': origin,
+        'updated_at': updatedAt,
+      };
+
+  ProfileEntry copyWith({
+    String? content,
+    String? evidence,
+    String? confidence,
+    String? origin,
+    String? updatedAt,
+  }) =>
+      ProfileEntry(
+        content: content ?? this.content,
+        evidence: evidence ?? this.evidence,
+        confidence: confidence ?? this.confidence,
+        origin: origin ?? this.origin,
+        updatedAt: updatedAt ?? this.updatedAt,
+      );
+}
+
+/// 个人说明书四板块（REQ-012 初始结构，可扩展）
+class UserPlaybook {
+  final List<ProfileEntry> traits; // 画像：我是什么样
+  final List<ProfileEntry> patterns; // 规律：什么导致什么
+  final List<ProfileEntry> recharges; // 充电法：什么恢复什么
+  final List<ProfileEntry> preferences; // 偏好：想被怎么对待
+  final String lastReviewAt; // 上次大复盘时间（10 天周期判定）
+
+  const UserPlaybook({
+    this.traits = const [],
+    this.patterns = const [],
+    this.recharges = const [],
+    this.preferences = const [],
+    this.lastReviewAt = '',
+  });
+
+  factory UserPlaybook.fromJson(Map<String, dynamic> j) => UserPlaybook(
+        traits: _entries(j['traits']),
+        patterns: _entries(j['patterns']),
+        recharges: _entries(j['recharges']),
+        preferences: _entries(j['preferences']),
+        lastReviewAt: (j['last_review_at'] ?? '').toString(),
+      );
+
+  static List<ProfileEntry> _entries(dynamic raw) => (raw as List? ?? [])
+      .whereType<Map>()
+      .map((m) => ProfileEntry.fromJson(Map<String, dynamic>.from(m)))
+      .toList(growable: false);
+
+  Map<String, dynamic> toJson() => {
+        'traits': traits.map((e) => e.toJson()).toList(),
+        'patterns': patterns.map((e) => e.toJson()).toList(),
+        'recharges': recharges.map((e) => e.toJson()).toList(),
+        'preferences': preferences.map((e) => e.toJson()).toList(),
+        'last_review_at': lastReviewAt,
+      };
+
+  bool get isEmpty =>
+      traits.isEmpty && patterns.isEmpty && recharges.isEmpty && preferences.isEmpty;
+
+  UserPlaybook copyWith({
+    List<ProfileEntry>? traits,
+    List<ProfileEntry>? patterns,
+    List<ProfileEntry>? recharges,
+    List<ProfileEntry>? preferences,
+    String? lastReviewAt,
+  }) =>
+      UserPlaybook(
+        traits: traits ?? this.traits,
+        patterns: patterns ?? this.patterns,
+        recharges: recharges ?? this.recharges,
+        preferences: preferences ?? this.preferences,
+        lastReviewAt: lastReviewAt ?? this.lastReviewAt,
+      );
+
+  static const sectionKeys = {
+    'traits': '画像',
+    'patterns': '规律',
+    'recharges': '充电法',
+    'preferences': '偏好',
+  };
 }
 
 // ============ 接收文件协议（D-002 四键）============
@@ -249,29 +388,72 @@ class StateUpdate {
       {'dim': dim, 'value': value, 'evidence': evidence};
 }
 
+/// 说明书操作（大模型 → App，REQ-012：改底色必须明示）
+class PlaybookOp {
+  final String op; // add / update / remove
+  final String section; // traits / patterns / recharges / preferences
+  final String? index; // update/remove 时的目标序号（字符串数字）
+  final ProfileEntry entry; // 新内容（add/update 时）
+
+  const PlaybookOp({
+    required this.op,
+    required this.section,
+    this.index,
+    required this.entry,
+  });
+
+  factory PlaybookOp.fromJson(Map<String, dynamic> j) => PlaybookOp(
+        op: (j['op'] ?? '').toString().toLowerCase(),
+        section: (j['section'] ?? '').toString().toLowerCase(),
+        index: j['index']?.toString(),
+        entry: j['entry'] is Map
+            ? ProfileEntry.fromJson(Map<String, dynamic>.from(j['entry']))
+            : const ProfileEntry(content: ''),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'op': op,
+        'section': section,
+        if (index != null) 'index': index,
+        'entry': entry.toJson(),
+      };
+}
+
 /// 安排块（安排模式，大模型 → App）
+/// M-034 多轨制：track 0=主轨（独占任务），1+ =伴随轨（并行轻任务，如等编译时背单词）。
+/// 结构天生支持任意轨数——数据层不设上限，渲染层默认展示主轨+伴随轨两层。
 class ScheduleBlock {
   final String start; // HH:mm
   final String end; // HH:mm
   final String matterRef; // 事项名称或引用
   final String reason; // 安排理由
+  final int track; // 轨道号：0 主轨 / 1,2,3… 伴随轨（M-034）
 
   const ScheduleBlock({
     required this.start,
     required this.end,
     required this.matterRef,
     this.reason = '',
+    this.track = 0,
   });
+
+  bool get isParallel => track > 0; // 伴随轨块（旧数据无 track 字段 → 0 → 主轨，兼容）
 
   factory ScheduleBlock.fromJson(Map<String, dynamic> j) => ScheduleBlock(
         start: (j['start'] ?? '').toString(),
         end: (j['end'] ?? '').toString(),
         matterRef: (j['matter_ref'] ?? (j['matterRef'] ?? '')).toString(),
         reason: (j['reason'] ?? '').toString(),
+        track: (j['track'] is int) ? j['track'] as int : (int.tryParse((j['track'] ?? '0').toString()) ?? 0),
       );
 
-  Map<String, dynamic> toJson() =>
-      {'start': start, 'end': end, 'matter_ref': matterRef, 'reason': reason};
+  Map<String, dynamic> toJson() => {
+        'start': start,
+        'end': end,
+        'matter_ref': matterRef,
+        'reason': reason,
+        if (track > 0) 'track': track, // 主轨不带字段（省空间+旧版兼容）
+      };
 
   /// 起止分钟数（自 00:00 起）；解析失败返回 null
   int? get startMinutes => _hhmmToMinutes(start);
@@ -293,12 +475,14 @@ class ReceiveFile {
   final List<StateUpdate> stateUpdates;
   final String reply; // 给用户的文字回复（兜底必展示）
   final List<ScheduleBlock> scheduleBlocks; // 仅安排模式
+  final List<PlaybookOp> playbookOps; // 说明书操作（REQ-012，M-032）
 
   const ReceiveFile({
     this.matterOps = const [],
     this.stateUpdates = const [],
     this.reply = '',
     this.scheduleBlocks = const [],
+    this.playbookOps = const [],
   });
 
   /// 容错解析：逐键独立，任一键畸形仅丢弃该键（D-002 红线：不崩溃、不写坏两库）
@@ -360,11 +544,23 @@ class ReceiveFile {
       }
     }
 
+    final pOps = <PlaybookOp>[];
+    if (root['playbook_ops'] is List) {
+      for (final e in root['playbook_ops'] as List) {
+        if (e is Map) {
+          try {
+            pOps.add(PlaybookOp.fromJson(Map<String, dynamic>.from(e)));
+          } catch (_) {}
+        }
+      }
+    }
+
     return ReceiveFile(
       matterOps: ops,
       stateUpdates: updates,
       reply: (root['reply'] ?? '').toString(),
       scheduleBlocks: blocks,
+      playbookOps: pOps,
     );
   }
 }

@@ -7,7 +7,7 @@ import 'package:integration_test/integration_test.dart';
 import 'package:shiwu_companion/main.dart';
 
 void main() {
-  final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
   testWidgets('启动→三页切换→设置页开合→展示页空态（单会话全流程）',
       (tester) async {

@@ -11,8 +11,11 @@ import 'safe_io.dart';
 class Repo {
   final File mattersFile;
   final File stateFile;
+  final File playbookFile; // 个人说明书（底色层，M-032）
 
-  Repo(this.mattersFile, this.stateFile);
+  Repo(this.mattersFile, this.stateFile, [File? playbookFile])
+      : playbookFile = playbookFile ??
+            File('${stateFile.parent.path}${Platform.pathSeparator}playbook.json');
 
   /// 工厂：按目录构造（目录自动创建，文件不存在时给空库）
   factory Repo.at(Directory dir) {
@@ -50,6 +53,81 @@ class Repo {
 
   void saveState(List<StateDay> days) {
     safeWriteJson(stateFile, days.map((d) => d.toJson()).toList());
+  }
+
+  // ============ 个人说明书（底色层，M-032 / REQ-012）============
+
+  UserPlaybook loadPlaybook() {
+    final decoded = readJsonWithFallback(playbookFile);
+    if (decoded is! Map) return const UserPlaybook();
+    return UserPlaybook.fromJson(Map<String, dynamic>.from(decoded));
+  }
+
+  void savePlaybook(UserPlaybook pb) {
+    safeWriteJson(playbookFile, pb.toJson());
+  }
+
+  /// 应用说明书增量：每板块独立、条目级校验（content 空丢弃；板块名未知丢弃）。
+  /// M-036：base 参数——传入内存中的当前说明书（总档案合并后，真相源是 profile 内存态）；
+  /// 缺省时读 playbook.json（旧路径，兼容旧测试）。
+  ApplyResult applyPlaybookOps(List<PlaybookOp> ops, {UserPlaybook? base}) {
+    var pb = base ?? loadPlaybook();
+    final log = <String>[];
+    final now = _nowIso();
+    final validSections = UserPlaybook.sectionKeys.keys.toSet();
+
+    for (final o in ops) {
+      if (!validSections.contains(o.section)) {
+        log.add('丢弃说明书操作：未知板块 ${o.section}');
+        continue;
+      }
+      if (o.entry.content.trim().isEmpty && o.op != 'remove') {
+        log.add('丢弃说明书操作：内容为空');
+        continue;
+      }
+      List<ProfileEntry> section(List<ProfileEntry> s) => s;
+      List<ProfileEntry> current = switch (o.section) {
+        'traits' => section(pb.traits),
+        'patterns' => section(pb.patterns),
+        'recharges' => section(pb.recharges),
+        _ => section(pb.preferences),
+      };
+      switch (o.op) {
+        case 'add':
+          final e = o.entry.copyWith(updatedAt: now);
+          current = [...current, e];
+          log.add('说明书·${UserPlaybook.sectionKeys[o.section]} 新增「${e.content}」（来源=${e.origin == 'user' ? '亲述' : 'AI'}）');
+        case 'update':
+          final i = int.tryParse(o.index ?? '-1') ?? -1;
+          if (i < 0 || i >= current.length) {
+            log.add('说明书修改越界（板块 ${o.section} 序号 $i），丢弃');
+            continue;
+          }
+          final e = o.entry.copyWith(updatedAt: now);
+          current = [...current]..[i] = e;
+          log.add('说明书·${UserPlaybook.sectionKeys[o.section]} 更新第${i + 1}条「${e.content}」');
+        case 'remove':
+          final i = int.tryParse(o.index ?? '-1') ?? -1;
+          if (i < 0 || i >= current.length) {
+            log.add('说明书删除越界（板块 ${o.section} 序号 $i），丢弃');
+            continue;
+          }
+          log.add('说明书·${UserPlaybook.sectionKeys[o.section]} 删除「${current[i].content}」');
+          current = [...current]..removeAt(i);
+        default:
+          log.add('丢弃说明书操作：未知 op ${o.op}');
+          continue;
+      }
+      pb = switch (o.section) {
+        'traits' => pb.copyWith(traits: current),
+        'patterns' => pb.copyWith(patterns: current),
+        'recharges' => pb.copyWith(recharges: current),
+        _ => pb.copyWith(preferences: current),
+      };
+    }
+
+    savePlaybook(pb);
+    return ApplyResult(pb, log);
   }
 
   // ============ 增量应用（接收文件 → 两库）============

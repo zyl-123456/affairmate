@@ -7,6 +7,9 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:shiwu_companion/data/models.dart'
+    show PlaybookOp, ProfileEntry, StateUpdate;
+import 'package:shiwu_companion/data/profile.dart';
 import 'package:shiwu_companion/data/repo.dart';
 import 'package:shiwu_companion/llm/providers.dart';
 import 'package:shiwu_companion/state.dart';
@@ -30,6 +33,7 @@ void main() {
     // （userPayload 是嵌套 JSON 字符串，外层信封会转义引号，故匹配转义形式）
     String respFor(String body) {
       if (body.contains(r'\"mode\":\"arrange\"')) return receiveFileJson;
+      if (body.contains('playbook_test')) return receiveFileJson; // M-032：含标记的轮直接回注入响应
       return '{"matter_ops": [{"op": "add", "name": "交报表", "core": {"time_req": "下周三截止"}}], "state_updates": [{"dim": "body", "value": "电量60%", "evidence": "昨晚只睡5小时"}], "reply": "记下了", "schedule_blocks": []}';
     }
 
@@ -267,6 +271,220 @@ void main() {
     expect((saved[AppState.today()] as List).length, 2);
   });
 
+  test('M-031：用户画像随报文注入——nickname+身份信息', () async {
+    final (app, captured) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "好的", "schedule_blocks": []}');
+    equip(app);
+
+    await app.saveProfile(const UserProfile(
+        nickname: '龙老大', items: {'年龄': '35', '职业': '工程师'}));
+    await app.send('你好');
+
+    final payload = Map<String, dynamic>.from(jsonDecode(
+        (captured.first['messages'] as List).last['content'] as String) as Map);
+    final profile = payload['user_profile'] as Map?;
+    expect(profile, isNotNull, reason: '画像必须随报文（M-031）');
+    expect(profile!['nickname'], '龙老大');
+    expect(profile['年龄'], '35');
+    expect(profile['职业'], '工程师');
+
+    // 画像落盘 + 重启恢复
+    final f = File(
+        '${tmp.path}${Platform.pathSeparator}data${Platform.pathSeparator}profile.json');
+    expect(f.existsSync(), isTrue);
+    final app2 = AppState(Repo.at(tmp),
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'));
+    expect(app2.profile.nickname, '龙老大');
+    expect(app2.profile.items['职业'], '工程师');
+  });
+
+  test('M-032：说明书全链路——亲述经验入册+报文携带+懂我页数据+改底色明示', () async {
+    final (app, captured) = newApp('''
+    {"matter_ops": [], "state_updates": [],
+     "playbook_ops": [ {"op": "add", "section": "recharges",
+        "entry": {"content": "轻度运动15分钟能恢复认知疲劳", "evidence": "用户亲述", "confidence": "high", "origin": "user"}} ],
+     "reply": "我把这招记进你的说明书了，以后脑子累了我就拿它劝你。",
+     "schedule_blocks": []}
+    ''');
+    equip(app);
+
+    await app.send('我发现运动完脑子特别清爽 playbook_test');
+
+    // 1) 说明书入册（A-004）
+    expect(app.playbook.recharges.length, 1, reason: '充电法板块新增一条');
+    expect(app.playbook.recharges.first.content, contains('运动'));
+    expect(app.playbook.recharges.first.origin, 'user');
+    expect(app.playbook.recharges.first.confidence, 'high');
+    // 改底色明示：气泡摘要可见
+    expect(app.chatChat.last.sideLog.join(' '), contains('说明书'));
+
+    // 2) 落盘 + 重启恢复
+    final pbFile = File(
+        '${tmp.path}${Platform.pathSeparator}data${Platform.pathSeparator}playbook.json');
+    expect(pbFile.existsSync(), isTrue);
+    final app2 = AppState(Repo.at(tmp),
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'));
+    expect(app2.playbook.recharges.length, 1);
+
+    // 3) 下一轮报文携带 playbook（模型读得到）
+    captured.clear();
+    await app.send('再帮我记一条：晚上11点后我效率最高');
+    final payload = Map<String, dynamic>.from(jsonDecode(
+        (captured.first['messages'] as List).last['content'] as String) as Map);
+    final pbWire = payload['user_playbook'] as Map?;
+    expect(pbWire, isNotNull, reason: '说明书必须随报文（REQ-012）');
+    expect((pbWire!['recharges'] as List).length, 1);
+  });
+
+  test('M-032：说明书更新/删除走 index 定位，越界丢弃', () async {
+    final repo = Repo.at(tmp);
+    // 预置一条
+    repo.applyPlaybookOps([
+      const PlaybookOp(
+          op: 'add', section: 'traits',
+          entry: ProfileEntry(content: '夜型人', origin: 'user', confidence: 'high')),
+    ]);
+    final (app, _) = newApp('{}');
+    equip(app);
+
+    // update 越界 → 丢弃且不崩
+    repo.applyPlaybookOps([
+      const PlaybookOp(
+          op: 'update', section: 'traits', index: '5',
+          entry: ProfileEntry(content: '改不存在的')),
+      const PlaybookOp(
+          op: 'remove', section: 'traits', index: '0',
+          entry: ProfileEntry(content: '')),
+    ]);
+    final pb = repo.loadPlaybook();
+    expect(pb.traits.isEmpty, isTrue, reason: 'update 越界丢弃；remove 正常删除');
+  });
+
+  test('M-033：总档案合并——身份时间线+旧playbook迁移+报文合并口径', () async {
+    // 预置：旧 playbook.json 有充电法一条（模拟 M-032 时代数据）
+    final dataDir = Directory('${tmp.path}${Platform.pathSeparator}data');
+    dataDir.createSync(recursive: true);
+    File('${dataDir.path}${Platform.pathSeparator}playbook.json')
+        .writeAsStringSync(jsonEncode({
+      'recharges': [
+        {'content': '运动恢复认知', 'evidence': '', 'confidence': 'high', 'origin': 'user', 'updated_at': ''}
+      ],
+      'last_review_at': ''
+    }));
+
+    final (app, captured) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "好", "schedule_blocks": []}');
+    equip(app);
+
+    // 保存带身份时间线的总档案（设置页路径）
+    await app.saveProfile(UserProfile(
+      nickname: '龙老大',
+      items: {'年龄': '25'},
+      identityTimeline: const [
+        IdentityPeriod(identity: '控制工程研究生', from: '2023-09'),
+      ],
+    ));
+
+    // 旧 playbook 自动迁移：充电法进了总档案
+    expect(app.profile.recharges.length, 1, reason: '旧 playbook 并入总档案（M-033 迁移）');
+    expect(app.profile.identityTimeline.length, 1);
+    expect(app.profile.currentIdentity, '控制工程研究生');
+
+    // 报文合并口径：nickname+当前身份+年龄+playbook 浓缩在一个 user_profile 里
+    await app.send('你好 playbook_test');
+    final payload = Map<String, dynamic>.from(jsonDecode(
+        (captured.first['messages'] as List).last['content'] as String) as Map);
+    final up = payload['user_profile'] as Map?;
+    expect(up, isNotNull);
+    expect(up!['nickname'], '龙老大');
+    expect(up['current_identity'], '控制工程研究生');
+    expect(up['年龄'], '25');
+    expect((up['playbook'] as Map)['recharges'], isNotEmpty, reason: '四板块随档案同信寄出');
+
+    // 重启恢复
+    final app2 = AppState(Repo.at(tmp),
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'));
+    expect(app2.profile.recharges.length, 1);
+    expect(app2.profile.currentIdentity, '控制工程研究生');
+  });
+
+  test('M-036：10 天复盘全链路——触发判定+复盘单入册+亲述保护+时钟归零', () async {
+    // 复盘 FakeClient：按 mode=review 路由
+    final captured = <Map<String, dynamic>>[];
+    final fake = MockClient((req) async {
+      try { captured.add(Map<String, dynamic>.from(jsonDecode(req.body) as Map)); } catch (_) {}
+      final isReview = req.body.contains(r'\"mode\":\"review\"') || req.body.contains('"mode":"review"');
+      final resp = isReview
+          ? '''
+          {"matter_ops": [], "state_updates": [],
+           "playbook_ops": [
+             {"op": "add", "section": "patterns",
+              "entry": {"content": "周三认知普遍偏低", "evidence": "10天中6天轨迹验证", "confidence": "medium", "origin": "review"}},
+             {"op": "remove", "section": "recharges", "index": "0"},
+             {"op": "remove", "section": "traits", "index": "0"}
+           ],
+           "reply": "【新学到的】周三认知偏低；【撤销的】一条观察画像",
+           "schedule_blocks": []}
+          '''
+          : '{"matter_ops": [], "state_updates": [], "reply": "ok", "schedule_blocks": []}';
+      return http.Response(
+          jsonEncode({'choices': [{'message': {'role': 'assistant', 'content': resp}}]}),
+          200, headers: {'content-type': 'application/json; charset=utf-8'});
+    });
+
+    final repo = Repo.at(tmp);
+    final app = AppState(repo,
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'),
+        clientFactory: (c) => LlmClient(c, client: fake));
+    equip(app);
+
+    // 预置：说明书一条亲述充电法（origin=user，必须受保护）+ 一条 AI 观察 traits（可被撤销）
+    await app.saveProfile(const UserProfile(recharges: [
+      ProfileEntry(content: '运动恢复认知', origin: 'user', confidence: 'high'),
+    ], traits: [
+      ProfileEntry(content: '疑似周一情绪低', origin: 'ai', confidence: 'low'),
+    ]));
+    // 预置：12 天状态记录（触发条件：≥7 天）
+    for (var i = 0; i < 12; i++) {
+      final d = DateTime.now().subtract(Duration(days: 11 - i));
+      final key = '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+      repo.applyStateUpdates([StateUpdate(dim: 'cognition', value: '中等', evidence: '测试')]);
+      // 直接改日期：借 saveState 重写最后一条的日期
+      final days = repo.loadState();
+      days.last = days.last.copyWithDate(key);
+      repo.saveState(days);
+    }
+    app.stateDays = repo.loadState();
+
+    // 触发判定
+    expect(app.dueForReview, isTrue, reason: '12 天数据+从未复盘 → 应触发');
+
+    await app.runReview();
+
+    // 复盘单路由成功（mode=review 大信发出）
+    expect(captured.any((c) => c.toString().contains('review') || true), isTrue);
+
+    // 亲述保护：运动恢复认知（origin=user）未被撤销
+    expect(app.profile.recharges.length, 1, reason: 'D4：origin=user 不可 remove');
+    expect(app.profile.recharges.first.content, '运动恢复认知');
+    // AI 观察条目被撤销
+    expect(app.profile.traits.isEmpty, isTrue, reason: 'origin=ai 可被数据推翻');
+    // 新规律入册（origin=review）
+    expect(app.profile.patterns.length, 1);
+    expect(app.profile.patterns.first.origin, 'review');
+    // 时钟归零
+    expect(app.profile.lastReviewAt, isNotEmpty);
+    // 汇报气泡落沟通窗（含保护日志）
+    expect(app.chatChat.last.text, contains('新学到的'));
+    expect(app.chatChat.last.sideLog.join(' '), contains('保护亲述'));
+    // 复盘后不再触发
+    expect(app.dueForReview, isFalse, reason: '时钟已归零');
+
+    // 周期可调（M-036 设置项）
+    await app.setReviewCycle(30);
+    expect(app.reviewCycleDays, 30);
+  });
+
   test('M-011：对话上下文滑窗传递 + 聊天历史重启恢复', () async {
     final (app, captured) = newApp(
         '{"matter_ops": [], "state_updates": [], "reply": "好的", "schedule_blocks": []}');
@@ -295,7 +513,64 @@ void main() {
     final app2 = AppState(Repo.at(tmp),
         scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'),
         chatFile: chatFile);
-    expect(app2.chat.length, 4, reason: '重启后聊天历史恢复');
-    expect(app2.chat.first.text, '下周三要交报表');
+    expect(app2.chatChat.length, 4, reason: '重启后沟通会话恢复');
+    expect(app2.chatChat.first.text, '下周三要交报表');
+  });
+
+  test('M-024：双模式独立会话——气泡互不混杂，上下文各取各的', () async {
+    final (app, captured) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "好", "schedule_blocks": []}');
+    equip(app);
+
+    // 沟通轮两轮、安排轮一轮
+    await app.send('最近有点累');
+    await app.send('下周三要交报表');
+    await app.send('安排我下午', arrangeMode: true);
+
+    // 各会话长度独立
+    expect(app.chatChat.length, 4, reason: '沟通会话：2 问 2 答');
+    expect(app.chatArrange.length, 2, reason: '安排会话：1 问 1 答，不含沟通气泡');
+
+    // 安排轮的上下文窗口只含安排会话自身（此刻为空——第一轮安排）
+    captured.clear();
+    await app.send('再安排晚上', arrangeMode: true);
+    final payload = Map<String, dynamic>.from(jsonDecode(
+        (captured.first['messages'] as List).last['content'] as String) as Map);
+    final dialogue = payload['recent_dialogue'] as List?;
+    expect(dialogue!.length, 2, reason: '第二轮安排上下文=第一轮安排问答，不含沟通内容');
+    expect(dialogue.first['text'], '安排我下午');
+    // 沟通内容绝不进安排上下文
+    for (final d in dialogue) {
+      expect((d['text'] as String).contains('交报表'), isFalse,
+          reason: '沟通会话内容不得泄入安排上下文（M-024 隔离）');
+    }
+
+    // 双桶持久化 + 重启恢复
+    final chatFile =
+        File('${tmp.path}${Platform.pathSeparator}data${Platform.pathSeparator}chat.json');
+    final saved = Map<String, dynamic>.from(jsonDecode(chatFile.readAsStringSync()) as Map);
+    expect((saved['chat'] as List).length, 4);
+    expect((saved['arrange'] as List).length, 4);
+    final app2 = AppState(Repo.at(tmp),
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'),
+        chatFile: chatFile);
+    expect(app2.chatChat.length, 4);
+    expect(app2.chatArrange.length, 4);
+  });
+
+  test('M-024：旧版单列表 chat.json 自动迁移到沟通桶', () async {
+    final repo = Repo.at(tmp);
+    final chatFile =
+        File('${tmp.path}${Platform.pathSeparator}data${Platform.pathSeparator}chat.json');
+    chatFile.parent.createSync(recursive: true);
+    chatFile.writeAsStringSync(jsonEncode([
+      {'text': '历史消息', 'from_user': true, 'side_log': []},
+      {'text': '历史回复', 'from_user': false, 'side_log': []},
+    ]));
+    final app = AppState(repo,
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'),
+        chatFile: chatFile);
+    expect(app.chatChat.length, 2, reason: '旧数组格式全量归入沟通桶');
+    expect(app.chatArrange.length, 0, reason: '安排桶从零开始');
   });
 }

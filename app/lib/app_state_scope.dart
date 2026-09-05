@@ -12,6 +12,12 @@ class InheritedAppState extends InheritedWidget {
   static AppState of(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<InheritedAppState>()!.app;
 
+  /// 定时器等无 BuildContext 安全依赖的场合用（M-035）
+  static AppState? maybeOf(BuildContext context) {
+    final w = context.getInheritedWidgetOfExactType<InheritedAppState>();
+    return w?.app;
+  }
+
   @override
   bool updateShouldNotify(InheritedAppState oldWidget) => app != oldWidget.app;
 }

@@ -32,15 +32,15 @@ void main() {
       expect(archivedW.first['name'], '旧事21');
     });
 
-    test('状态库只发最近 7 天', () {
+    test('状态库只发今天+昨天（M-032 两层策略：底色走 playbook 字段）', () {
       final days = [
         for (var i = 1; i <= 15; i++)
           StateDay(date: '2026-09-${i.toString().padLeft(2, '0')}'),
       ];
       final wire = LlmClient.wireState(days);
-      expect(wire.length, 7);
+      expect(wire.length, 2, reason: 'REQ-011：底色+今日+昨日替代 7 天流水');
       expect(wire.first['date'], '2026-09-15', reason: '最新在前');
-      expect(wire.last['date'], '2026-09-09');
+      expect(wire.last['date'], '2026-09-14', reason: '昨天作参照');
     });
   });
 

@@ -77,10 +77,14 @@ class LlmClient {
     required String userMessage,
     bool arrangeMode = false,
     List<Map<String, dynamic>> recentDialogue = const [],
+    Map<String, dynamic> userProfile = const {},
+    UserPlaybook playbook = const UserPlaybook(),
   }) async {
     final mattersWire = wireMatters(matters);
     final userPayload = jsonEncode({
       'mode': arrangeMode ? 'arrange' : 'chat',
+      if (userProfile.isNotEmpty) 'user_profile': userProfile,
+      if (!playbook.isEmpty) 'user_playbook': playbook.toJson(),
       'matters_kb': mattersWire,
       'state_kb': wireState(state),
       if (recentDialogue.isNotEmpty)
@@ -97,6 +101,35 @@ class LlmClient {
 
   // ============ wire 层裁剪（M-014 报文瘦身，盘上数据不动）============
 
+  /// M-036 复盘调用：近 N 天状态全量 + 日程 + 现说明书 + 画像 → 复盘模式提示词。
+  /// 输出协议与日常一致（同一张工作单），解析复用 ReceiveFile.parse。
+  Future<ReceiveFile> reviewChat({
+    required List<StateDay> state,
+    required Map<String, dynamic> scheduleAll,
+    required UserPlaybook playbook,
+    required Map<String, dynamic> userProfile,
+    required int days,
+  }) async {
+    // 近 N 天状态（按日期倒序取）
+    final sorted = [...state]..sort((a, b) => b.date.compareTo(a.date));
+    final kept = sorted.length > days ? sorted.sublist(0, days) : sorted;
+
+    final userPayload = jsonEncode({
+      'mode': 'review',
+      'days': days,
+      if (userProfile.isNotEmpty) 'user_profile': userProfile,
+      if (!playbook.isEmpty) 'user_playbook': playbook.toJson(),
+      'state_history': kept.map((d) => d.toJson()).toList(),
+      'schedule_history': scheduleAll,
+    });
+
+    final raw = await _chatCompletion(
+      system: kReviewSystemPrompt,
+      user: userPayload,
+    );
+    return ReceiveFile.parse(raw);
+  }
+
   /// 发送口径的事项库：在办全量；归档仅名称且只发最近 30 个（长期使用防 token 膨胀）。
   static List<Map<String, dynamic>> wireMatters(List<Matter> matters) {
     final active = matters.where((m) => m.active).map((m) => m.toWireJson()).toList();
@@ -109,10 +142,11 @@ class LlmClient {
     return [...active, ...archivedKept];
   }
 
-  /// 发送口径的状态库：只发最近 7 天（认知画像看近期足够；盘上全量保留）。
+  /// 发送口径的状态库（M-032 两层策略）：底色层浓缩由 playbook 携带（chat 参数）；
+  /// 实况层只发今天 + 昨天作参照（底色已含长期规律，7 天流水冗余——REQ-011）。
   static List<Map<String, dynamic>> wireState(List<StateDay> state) {
     final sorted = [...state]..sort((a, b) => b.date.compareTo(a.date));
-    final kept = sorted.length > 7 ? sorted.sublist(0, 7) : sorted;
+    final kept = sorted.length > 2 ? sorted.sublist(0, 2) : sorted;
     return kept.map((d) => d.toJson()).toList();
   }
 
@@ -300,4 +334,30 @@ class ProviderStore {
     all['active_provider'] = id;
     await _writeAll(all);
   }
+
+  /// 完整激活供应商（含 Key）——语音云端转写等单点消费方用（M-026）
+  static Future<ProviderConfig?> activeProvider() async {
+    final all = await _readAll();
+    final activeId = all['active_provider']?.toString();
+    if (activeId == null) return null;
+    final list = ((all['providers'] as List?) ?? [])
+        .whereType<Map>()
+        .map((m) => ProviderConfig.fromJson(Map<String, dynamic>.from(m)))
+        .toList();
+    final c = list.where((p) => p.id == activeId).firstOrNull;
+    if (c == null) return null;
+    return c.copyWith(apiKey: (all['key_${c.id}'] ?? '').toString());
+  }
+
+  /// 支持目录（语音模块复用同一路径规则，M-026）
+  static Future<Directory> supportDir() async => _file().then((f) => f.parent);
+
+  // ============ 备份导出/导入（M-027 换机迁移）============
+
+  /// 导出全部供应商配置（含 Key）——备份用
+  static Future<Map<String, dynamic>> exportAll() async => _readAll();
+
+  /// 整体导入供应商配置（含 Key）——换机恢复用，原子替换
+  static Future<void> importAll(Map<String, dynamic> data) async =>
+      _writeAll(data);
 }

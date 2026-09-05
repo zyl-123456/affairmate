@@ -1,26 +1,73 @@
-// 展示页 · 24h 时间进度条 + 事项列表 + 四维状态
-// 对应设计：D-006（TECH-007）——REQ-007 三类信息
+// 展示页 · 24h 时间进度条 + 事项列表 + 四维状态 + 日历回看
+// 对应设计：D-006（TECH-007）——REQ-007 三类信息；M-034 历史日程回看
 
 import 'package:flutter/material.dart';
 
 import '../data/models.dart';
+import '../data/safe_io.dart';
 import '../state.dart';
 
-class TimelinePage extends StatelessWidget {
+class TimelinePage extends StatefulWidget {
   final AppState app;
   const TimelinePage({super.key, required this.app});
+
+  @override
+  State<TimelinePage> createState() => _TimelinePageState();
+}
+
+class _TimelinePageState extends State<TimelinePage> {
+  String? _viewingDate; // null=今天；否则回看历史某天（M-034）
+  Map<String, dynamic> _allSchedule = {};
+
+  AppState get app => widget.app;
+
+  @override
+  void initState() {
+    super.initState();
+    _allSchedule = _readAllSchedule();
+    app.addListener(_onAppChange);
+  }
+
+  void _onAppChange() {
+    // 安排更新时刷新本地缓存（新安排落盘后）
+    if (app.schedule.isNotEmpty) _allSchedule = _readAllSchedule();
+  }
+
+  @override
+  void dispose() {
+    app.removeListener(_onAppChange);
+    super.dispose();
+  }
+
+  Map<String, dynamic> _readAllSchedule() {
+    final f = app.scheduleFileForRead;
+    final decoded = f.existsSync() ? readJsonWithFallback(f) : null;
+    return decoded is Map ? Map<String, dynamic>.from(decoded) : {};
+  }
+
+  List<ScheduleBlock> _blocksFor(String date) {
+    final bucket = _allSchedule[date];
+    if (bucket is! List) return [];
+    return bucket
+        .whereType<Map>()
+        .map((m) => ScheduleBlock.fromJson(Map<String, dynamic>.from(m)))
+        .toList();
+  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final onMatters = app.matters.where((m) => m.active).toList();
     final today = _todayStr();
+    final viewingToday = _viewingDate == null || _viewingDate == today;
+    final dateKey = viewingToday ? today : _viewingDate!;
+    final blocks = viewingToday ? app.schedule : _blocksFor(dateKey);
     final todayState = app.stateDays.where((d) => d.date == today).firstOrNull;
 
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
-        // —— 时间进度条 ——
+        // —— 时间进度条（M-034：支持回看任意历史日）——
         Card(
           elevation: 0,
           color: scheme.surfaceContainerLow,
@@ -33,32 +80,87 @@ class TimelinePage extends StatelessWidget {
                   children: [
                     Icon(Icons.view_timeline_outlined, size: 18, color: scheme.primary),
                     const SizedBox(width: 6),
-                    const Text('今日时间进度条',
-                        style: TextStyle(fontWeight: FontWeight.w600)),
-                    const Spacer(),
                     Text(
-                      app.schedule.isEmpty ? '暂无安排块' : '最近安排已落位',
-                      style: TextStyle(fontSize: 11, color: scheme.outline),
+                        viewingToday
+                            ? '今日时间进度条'
+                            : '$dateKey 的安排（回看）',
+                        style: const TextStyle(fontWeight: FontWeight.w600)),
+                    const Spacer(),
+                    // 日历入口（M-034：点开月历，有安排的日子带标记）
+                    IconButton(
+                      icon: Icon(Icons.calendar_month_outlined,
+                          size: 18, color: scheme.primary),
+                      tooltip: '日历回看',
+                      onPressed: () => _pickDate(context),
                     ),
+                    if (!viewingToday)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 4),
+                        child: TextButton(
+                          onPressed: () => setState(() => _viewingDate = null),
+                          child: const Text('回今天', style: TextStyle(fontSize: 11)),
+                        ),
+                      ),
                   ],
                 ),
                 const SizedBox(height: 10),
-                TimeBar(blocks: app.schedule),
-                if (app.schedule.isNotEmpty)
+                TimeBar(blocks: blocks),
+                if (blocks.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 8),
                     child: Wrap(
                       spacing: 10,
                       runSpacing: 4,
                       children: [
-                        for (final b in app.schedule)
+                        for (final b in blocks)
                           Text(
-                            '${b.start}~${b.end} ${b.matterRef}',
+                            '${b.isParallel ? "∥" : ""}${b.start}~${b.end} ${b.matterRef}',
                             style: TextStyle(fontSize: 11, color: scheme.outline),
                           ),
                       ],
                     ),
                   ),
+                // M-035 空洞清单：今天已过时段中未记录的部分（回看时"时间哪去了"）
+                if (viewingToday) () {
+                  final now = DateTime.now();
+                  final nowMin = now.hour * 60 + now.minute;
+                  // 只统计今天 8 点（起床口径）到当前时间的洞
+                  final gaps = AppState.uncoveredGaps(blocks,
+                      fromMinute: 8 * 60, toMinute: nowMin, minMinutes: 30);
+                  if (gaps.isEmpty) return const SizedBox.shrink();
+                  final totalMin = gaps.fold<int>(0, (s, g) => s + (g.$2 - g.$1));
+                  return Container(
+                    margin: const EdgeInsets.only(top: 10),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: scheme.errorContainer.withOpacity(0.35),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(children: [
+                          Icon(Icons.help_outline, size: 15, color: scheme.error),
+                          const SizedBox(width: 5),
+                          Text('这些时间还没有记录（共 ${(totalMin / 60).toStringAsFixed(1)} 小时）',
+                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: scheme.error)),
+                        ]),
+                        const SizedBox(height: 4),
+                        Wrap(
+                          spacing: 10,
+                          children: [
+                            for (final (gs, ge) in gaps)
+                              Text('${AppState.fmtMin(gs)}~${AppState.fmtMin(ge)}',
+                                  style: TextStyle(fontSize: 11, color: scheme.outline)),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text('去沟通页告诉 AI 刚才做了什么（如"10点到12点其实在刷视频"），它会补上记录。',
+                            style: TextStyle(fontSize: 10.5, color: scheme.outline, height: 1.5)),
+                      ],
+                    ),
+                  );
+                }(),
               ],
             ),
           ),
@@ -373,6 +475,43 @@ class TimelinePage extends StatelessWidget {
     final n = DateTime.now();
     return '${n.year.toString().padLeft(4, '0')}-${n.month.toString().padLeft(2, '0')}-${n.day.toString().padLeft(2, '0')}';
   }
+
+  /// M-034 日历回看：弹月历（selectableDayYesterday 起全可选），选中即切到那天
+  Future<void> _pickDate(BuildContext context) async {
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: DateTime.tryParse(_viewingDate ?? _todayStr()) ?? now,
+      firstDate: DateTime(2020),
+      lastDate: now,
+      helpText: '选择要回看的日期',
+      cancelText: '取消',
+      confirmText: '查看',
+    );
+    if (picked == null) return;
+    final key =
+        '${picked.year.toString().padLeft(4, '0')}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+    setState(() => _viewingDate = key);
+  }
+}
+
+/// M-035 空洞斜纹画笔：45° 细斜线，视觉上与实色块区分
+class _GapPainter extends CustomPainter {
+  final Color color;
+  const _GapPainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1;
+    for (var x = -size.height; x < size.width; x += 5) {
+      canvas.drawLine(Offset(x, size.height), Offset(x + size.height, 0), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _GapPainter oldDelegate) => color != oldDelegate.color;
 }
 
 /// 24 小时水平时间条：安排块着色 + 当前时间指示线
@@ -411,7 +550,26 @@ class TimeBar extends StatelessWidget {
                     borderRadius: BorderRadius.circular(8),
                   ),
                 ),
-                // 安排块
+                // M-035 空洞高亮：主轨未覆盖时段画斜纹条（一眼看到"时间哪去了"）
+                for (final (gs, ge) in AppState.uncoveredGaps(blocks))
+                  () {
+                    final left = gs / 1440.0 * w;
+                    final width = (ge - gs) / 1440.0 * w;
+                    return Positioned(
+                      left: left,
+                      width: width,
+                      top: 4,
+                      bottom: 4,
+                      child: Tooltip(
+                        message: '${AppState.fmtMin(gs)}~${AppState.fmtMin(ge)} 未记录',
+                        child: CustomPaint(
+                          painter: _GapPainter(color: scheme.outline.withOpacity(0.25)),
+                          size: Size(width, 38),
+                        ),
+                      ),
+                    );
+                  }(),
+                // 安排块（M-034 多轨：主轨占满条高；伴随轨细条贴底、半透明）
                 for (var i = 0; i < blocks.length; i++)
                   () {
                     final b = blocks[i];
@@ -420,25 +578,33 @@ class TimeBar extends StatelessWidget {
                     if (s == null || e == null || e <= s) return const SizedBox.shrink();
                     final left = s / 1440.0 * w;
                     final width = (e - s) / 1440.0 * w;
+                    final isParallel = b.isParallel;
                     return Positioned(
                       left: left,
                       width: width,
-                      top: 4,
-                      bottom: 4,
+                      // 主轨满高；伴随轨：底部 1/3 细条，多伴随轨逐级上移（罕见）
+                      top: isParallel ? 46 - 4 - 12 - (b.track - 1) * 5 : 4,
+                      bottom: isParallel ? 4 + (b.track - 1) * 5 : 4,
                       child: Tooltip(
-                        message: '${b.start}~${b.end} ${b.matterRef}\n${b.reason}',
+                        message:
+                            '${isParallel ? "[并行·轨${b.track}] " : ""}${b.start}~${b.end} ${b.matterRef}\n${b.reason}',
                         child: Container(
                           alignment: Alignment.center,
                           padding: const EdgeInsets.symmetric(horizontal: 3),
                           decoration: BoxDecoration(
-                            color: _palette[i % _palette.length],
-                            borderRadius: BorderRadius.circular(5),
+                            color: _palette[i % _palette.length]
+                                .withOpacity(isParallel ? 0.55 : 1.0),
+                            borderRadius: BorderRadius.circular(isParallel ? 3 : 5),
+                            border: isParallel
+                                ? Border.all(color: scheme.outline.withOpacity(0.4), width: 0.5)
+                                : null,
                           ),
                           child: Text(
                             b.matterRef,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 9, color: Colors.white),
+                            style: TextStyle(
+                                fontSize: isParallel ? 7.5 : 9, color: Colors.white),
                           ),
                         ),
                       ),
