@@ -69,6 +69,23 @@ if (-not $NoBuild) {
 }
 
 # ---------- 3. 安装并拉起 ----------
+Step "构建后铁律检查：dex 里必须有 GeneratedPluginRegistrant（缺=启动必转圈废包）"
+$dexOk = $false
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$apkZip = [System.IO.Compression.ZipFile]::OpenRead($apk)
+foreach ($entry in $apkZip.Entries) {
+    if ($entry.FullName -like "classes*.dex") {
+        $ms = New-Object System.IO.MemoryStream
+        $entry.Open().CopyTo($ms)
+        if ([System.Text.Encoding]::ASCII.GetString($ms.ToArray()).Contains("GeneratedPluginRegistrant")) {
+            $dexOk = $true; break
+        }
+    }
+}
+$apkZip.Dispose()
+if (-not $dexOk) { throw "废包：dex 缺 GeneratedPluginRegistrant（插件注册丢失，装上必转圈）——车间 android 缺 registrant，从源仓拷贝后重编" }
+Write-Host "dex 检查通过" -ForegroundColor Green
+
 Step "安装并启动 App"
 & $Adb install -r $apk
 if ($LASTEXITCODE -ne 0) { throw "APK 安装失败" }

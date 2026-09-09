@@ -8,13 +8,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shiwu_companion/data/models.dart'
-    show PlaybookOp, ProfileEntry, StateUpdate;
+    show PlaybookOp, ProfileEntry, StateUpdate, GoalOp, Goal;
 import 'package:shiwu_companion/data/profile.dart';
 import 'package:shiwu_companion/data/repo.dart';
 import 'package:shiwu_companion/llm/providers.dart';
 import 'package:shiwu_companion/state.dart';
 
 void main() {
+  AppState.wakelockCapable = false; // M-065：测试环境无平台通道
   late Directory tmp;
 
   setUp(() {
@@ -33,25 +34,63 @@ void main() {
     // （userPayload 是嵌套 JSON 字符串，外层信封会转义引号，故匹配转义形式）
     String respFor(String body) {
       if (body.contains(r'\"mode\":\"arrange\"')) return receiveFileJson;
-      if (body.contains('playbook_test')) return receiveFileJson; // M-032：含标记的轮直接回注入响应
+      // M-032/038：解外层信封取内层 user_said 值——仅本轮说的话含标记才注入
+      // （防 recent_dialogue 历史携带标记导致后续轮误路由重复入账）
+      String? saidThisTurn;
+      try {
+        final outer = jsonDecode(body) as Map;
+        final inner = jsonDecode((outer['messages'] as List).last['content'] as String) as Map;
+        saidThisTurn = inner['user_said']?.toString();
+      } catch (_) {}
+      if (saidThisTurn != null && saidThisTurn.contains('playbook_test')) return receiveFileJson;
       return '{"matter_ops": [{"op": "add", "name": "交报表", "core": {"time_req": "下周三截止"}}], "state_updates": [{"dim": "body", "value": "电量60%", "evidence": "昨晚只睡5小时"}], "reply": "记下了", "schedule_blocks": []}';
     }
 
-    final fake = MockClient((req) async {
-      if (req.body.isNotEmpty) {
+    // M-046：MockClient.streaming 支持 send()——stream:true 请求回 SSE chunk 流，
+    // 普通请求回一次性 JSON（两条路径都测到）
+    final fake = MockClient.streaming((req, bodyStream) async {
+      var body = '';
+      await for (final c in bodyStream) {
+        body += utf8.decode(c);
+      }
+      if (body.isNotEmpty) {
         try {
-          captured.add(Map<String, dynamic>.from(jsonDecode(req.body) as Map));
+          captured.add(Map<String, dynamic>.from(jsonDecode(body) as Map));
         } catch (_) {}
+      }
+      final wantsStream = body.contains('"stream":true') || body.contains('"stream": true');
+      if (wantsStream) {
+        // SSE：把完整回复拆成两个 chunk 模拟流式
+        final full = respFor(body);
+        final mid = (full.length ~/ 2).clamp(1, full.length - 1);
+        final p1 = jsonEncode({
+          'choices': [
+            {'delta': {'content': full.substring(0, mid)}}
+          ]
+        });
+        final p2 = jsonEncode({
+          'choices': [
+            {'delta': {'content': full.substring(mid)}}
+          ]
+        });
+        final sse = 'data: $p1\n\ndata: $p2\n\ndata: [DONE]\n\n';
+        final bytes = utf8.encode(sse);
+        return http.StreamedResponse(
+          http.ByteStream.fromBytes(bytes),
+          200,
+          headers: {'content-type': 'text/event-stream; charset=utf-8'},
+        );
       }
       final envelope = jsonEncode({
         'choices': [
-          {'message': {'role': 'assistant', 'content': respFor(req.body)}}
+          {'message': {'role': 'assistant', 'content': respFor(body)}}
         ],
       });
-      // 显式 UTF-8：http.Response 默认 latin1，中文响应体会直接 ArgumentError
-      return http.Response(envelope, 200, headers: {
-        'content-type': 'application/json; charset=utf-8',
-      });
+      return http.StreamedResponse(
+        http.ByteStream.fromBytes(utf8.encode(envelope)),
+        200,
+        headers: {'content-type': 'application/json; charset=utf-8'},
+      );
     });
 
     final repo = Repo.at(tmp);
@@ -233,18 +272,48 @@ void main() {
       ''',
     ];
 
-    final fake = MockClient((req) async {
-      final isArrange = req.body.contains(r'\"mode\":\"arrange\"');
-      final rf = isArrange
-          ? arrangeResponses[arrangeCalls++ % arrangeResponses.length]
-          : '{"matter_ops": [], "state_updates": [], "reply": "好", "schedule_blocks": []}';
-      return http.Response(
-          jsonEncode({
-            'choices': [
-              {'message': {'role': 'assistant', 'content': rf}}
-            ],
-          }),
+    // M-046：旧 MockClient 的 send() 也会调 handler → 流式探测+回退 = handler 双调用，
+    // 计数错乱。改用 streaming-aware：流式请求直接回 SSE，非流式回 JSON，各只调一次。
+    String? pendingRf; // 流式探测预取的响应（回退时复用，不再 ++）
+    final fake = MockClient.streaming((req, bodyStream) async {
+      var body = '';
+      await for (final c in bodyStream) {
+        body += utf8.decode(c);
+      }
+      final wantsStream = body.contains('"stream":true');
+      final isArrange = body.contains(r'\"mode\":\"arrange\"');
+      String rf;
+      if (wantsStream) {
+        rf = isArrange
+            ? arrangeResponses[arrangeCalls++ % arrangeResponses.length] // 流式成功即消耗计数（正常生产路径）
+            : '{"matter_ops": [], "state_updates": [], "reply": "好", "schedule_blocks": []}';
+        pendingRf = rf;
+        final p = jsonEncode({
+          'choices': [
+            {'delta': {'content': rf}}
+          ]
+        });
+        final sse = 'data: $p\n\ndata: [DONE]\n\n';
+        return http.StreamedResponse(
+          http.ByteStream.fromBytes(utf8.encode(sse)),
           200,
+          headers: {'content-type': 'text/event-stream; charset=utf-8'},
+        );
+      }
+      // 非流式（回退）：复用预取的，不重复计数
+      rf = pendingRf ??
+          (isArrange
+              ? arrangeResponses[arrangeCalls++ % arrangeResponses.length]
+              : '{"matter_ops": [], "state_updates": [], "reply": "好", "schedule_blocks": []}');
+      pendingRf = null;
+      final envelope = jsonEncode({
+        'choices': [
+          {'message': {'role': 'assistant', 'content': rf}}
+        ],
+      });
+      return http.StreamedResponse(
+        http.ByteStream.fromBytes(utf8.encode(envelope)),
+        200,
           headers: {'content-type': 'application/json; charset=utf-8'});
     });
 
@@ -483,6 +552,170 @@ void main() {
     // 周期可调（M-036 设置项）
     await app.setReviewCycle(30);
     expect(app.reviewCycleDays, 30);
+  });
+
+  test('M-038：身份与称呼对话自动入档（老大裁决：不让用户填表）', () async {
+    final (app, captured) = newApp('''
+    {"matter_ops": [], "state_updates": [],
+     "profile_ops": [
+       {"op": "set_nickname", "nickname": "龙老大"},
+       {"op": "add_identity", "identity": "广西大学 自动化 本科", "from": "2020-09"},
+       {"op": "add_identity", "identity": "控制工程 硕士研究生", "from": "2024-09"}
+     ],
+     "reply": "记下了，龙老大！你的两段学生涯我都入档了。",
+     "schedule_blocks": []}
+    ''');
+    equip(app);
+
+    await app.send('我2020年考上广西大学读自动化，2024年开始读研 playbook_test');
+
+    // 称呼
+    expect(app.profile.nickname, '龙老大');
+    // 身份时间线两段，末段=至今
+    expect(app.profile.identityTimeline.length, 2);
+    expect(app.profile.identityTimeline.first.identity, contains('广西大学'));
+    expect(app.profile.identityTimeline.first.from, '2020-09');
+    expect(app.profile.currentIdentity, contains('硕士'));
+    expect(app.profile.identityTimeline.last.isCurrent, isTrue);
+    // 明示日志
+    expect(app.chatChat.last.sideLog.join(' '), contains('称呼'));
+    expect(app.chatChat.last.sideLog.join(' '), contains('身份入档'));
+    // 报文携带（下一轮——不再带 playbook_test 标记，走默认响应避免重复入档）
+    captured.clear();
+    await app.send('你好');
+    final payload = Map<String, dynamic>.from(jsonDecode(
+        (captured.first['messages'] as List).last['content'] as String) as Map);
+    expect((payload['user_profile'] as Map)['nickname'], '龙老大');
+    expect((payload['user_profile'] as Map)['current_identity'], contains('硕士'));
+    // 落盘+重启
+    final app2 = AppState(Repo.at(tmp),
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'));
+    expect(app2.profile.nickname, '龙老大');
+    expect(app2.profile.identityTimeline.length, 2);
+  });
+
+  test('M-040：目标两型+进度累积史（不覆盖）+终身型保护', () async {
+    final (app, _) = newApp('''
+    {"matter_ops": [], "state_updates": [],
+     "goal_ops": [
+       {"op": "add", "title": "维持好体态和健康", "goal_type": "lifelong"},
+       {"op": "set_progress", "id": "PLACEHOLDER", "progress": "完成跑步5km，本周第2次", "date": "2026-09-06"},
+       {"op": "set_progress", "id": "PLACEHOLDER", "progress": "俯卧撑60个", "date": "2026-09-07"},
+       {"op": "archive", "id": "PLACEHOLDER", "progress": "目标达成"}
+     ],
+     "reply": "记下了", "schedule_blocks": []}
+    ''');
+    equip(app);
+
+    // 纯逻辑路径：直接应用 goal_ops
+    app.goals = [];
+    // 手动模拟 add
+    final ops1 = [GoalOp(op: 'add', title: '维持好体态和健康')];
+    final (g1, l1) = app.applyGoalOpsForTest(ops1);
+    expect(g1.length, 1);
+    expect(l1.join(' '), contains('已建立')); // M-053：无类型标签
+    final gid = g1.first.id;
+
+    // 进度累积：两条不同日期
+    final ops2 = [
+      GoalOp(op: 'set_progress', id: gid, progress: '完成跑步5km，本周第2次', date: '2026-09-06'),
+      GoalOp(op: 'set_progress', id: gid, progress: '俯卧撑60个', date: '2026-09-07'),
+    ];
+    final (g2, _) = app.applyGoalOpsForTest(ops2);
+    expect(g2.first.progressHistory.length, 2, reason: 'M-040：累积不覆盖');
+    expect(g2.first.progress, contains('俯卧撑'), reason: 'progress 存最新');
+    expect(g2.first.progressHistory.first['date'], '2026-09-06');
+    expect(g2.first.progressHistory.last['note'], contains('俯卧撑'));
+
+    // M-053：类型保护已删（goal_type 不存在）——archive 直接生效
+    final (g4, _) = app.applyGoalOpsForTest([GoalOp(op: 'archive', id: gid)]);
+    expect(g4.first.active, isFalse, reason: '归档生效（M-053 后无类型拦截）');
+
+    // 重启恢复（历史在盘上）
+    final app3 = AppState(Repo.at(tmp),
+        scheduleFile: File('${tmp.path}${Platform.pathSeparator}schedule.json'));
+    expect(app3.goals.first.progressHistory.length, 2, reason: '累积史落盘恢复');
+  });
+
+  test('M-059：一轮创建即挂目标（matter add 带 goal_ref）', () async {
+    final (app, _) = newApp('''
+    {"matter_ops": [{"op": "add", "name": "雅思单词视频", "goal_ref": "g_existing"}],
+     "state_updates": [], "reply": "建好并挂上了", "schedule_blocks": []}
+    ''');
+    // 预置目标
+    app.goals = [const Goal(id: 'g_existing', title: '考雅思', createdAt: '', updatedAt: '')];
+    equip(app);
+
+    await app.send('帮我建个雅思单词视频的事项，挂在考雅思目标下 playbook_test');
+
+    final m = app.matters.firstWhere((m) => m.name.contains('雅思单词'));
+    expect(m.goalRef, 'g_existing', reason: 'M-059：add 带 goal_ref 一步挂上');
+    expect(app.chatChat.last.sideLog.join(' '), contains('新增'));
+  });
+
+  test('M-060：睡眠感知——说"睡到X点"记录醒时+晨报到期能触发', () async {
+    final (app, _) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "晚安", "schedule_blocks": []}');
+    equip(app);
+
+    // M-079 显式制：无"晨报"字=纯闹钟（旧版"睡到X点"推晨报已废）
+    await app.send('我要睡了，睡到明天10点');
+    expect(app.chatChat.last.sideLog.join(' '), contains('闹钟已设'),
+        reason: 'M-079：没说晨报二字=纯闹钟');
+
+    // 显式说晨报 → 出晨报
+    await app.send('我要睡了，睡到明天10点，醒了给我晨报');
+    expect(app.chatChat.last.sideLog.join(' '), contains('响铃并出晨报'),
+        reason: 'M-079：说了晨报=出晨报');
+
+    // 晨报未到期（醒时在未来）
+    expect(app.morningBriefDue, isFalse, reason: '醒时未到不发');
+  });
+
+  test('M-060b：睡眠正则变体（睡8小时/睡到7点半）', () async {
+    final (app, _) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "好梦", "schedule_blocks": []}');
+    equip(app);
+    await app.send('现在准备休息了，睡8小时');
+    expect(app.chatChat.last.sideLog.join(' '), anyOf(contains('闹钟已设'), contains('已记睡眠')),
+        reason: 'M-079 显式制：无晨报字=纯闹钟（闹钟已设）');
+  });
+
+  test('M-061b：午睡分钟+对话选铃声', () async {
+    final (app, _) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "好梦", "schedule_blocks": []}');
+    equip(app);
+    await app.send('我要午睡10分钟，用铃声3');
+    expect(app.chatChat.last.sideLog.join(' '), contains('铃声3'));
+    expect(app.alarmSlot, 3);
+  });
+
+  test('M-074：一轮建多目标 id 互异（防同毫秒碰撞）', () async {
+    final (app, _) = newApp('''
+    {"goal_ops": [
+      {"op": "add", "title": "目标A"},
+      {"op": "add", "title": "目标B"},
+      {"op": "add", "title": "目标C"}
+    ], "state_updates": [], "reply": "建好三个", "schedule_blocks": []}
+    ''');
+    equip(app);
+    await app.send('建三个目标 playbook_test');
+    expect(app.goals.length, 3);
+    final ids = app.goals.map((g) => g.id).toSet();
+    expect(ids.length, 3, reason: 'M-074：同轮多目标 id 必须互异');
+  });
+
+  test('M-077：闹钟句不带睡字也能触发（老大 19:28 日志场景）', () async {
+    final (app, _) = newApp(
+        '{"matter_ops": [], "state_updates": [], "reply": "好的", "schedule_blocks": []}');
+    equip(app);
+    // 场景1：三分钟之后的闹钟（无睡字）
+    await app.send('我想测试一下闹钟的效果，给我设定一个三分钟之后的闹钟。');
+    expect(app.chatChat.last.sideLog.join(' '), contains('闹钟已设'),
+        reason: 'M-077：闹钟词+N分钟后 要触发意图');
+    // 场景2：再设置一个一分钟之后的闹钟
+    await app.send('再设置一个一分钟之后的闹钟。');
+    expect(app.chatChat.last.sideLog.join(' '), contains('闹钟已设'));
   });
 
   test('M-011：对话上下文滑窗传递 + 聊天历史重启恢复', () async {

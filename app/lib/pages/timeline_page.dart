@@ -62,7 +62,8 @@ class _TimelinePageState extends State<TimelinePage> {
     final viewingToday = _viewingDate == null || _viewingDate == today;
     final dateKey = viewingToday ? today : _viewingDate!;
     final blocks = viewingToday ? app.schedule : _blocksFor(dateKey);
-    final todayState = app.stateDays.where((d) => d.date == today).firstOrNull;
+    // UI-07（老大 04:59）：状态跟随日历所选日期——回看 8/31 就显示 8/31 的四维
+    final todayState = app.stateDays.where((d) => d.date == dateKey).firstOrNull;
 
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -105,17 +106,32 @@ class _TimelinePageState extends State<TimelinePage> {
                 ),
                 const SizedBox(height: 10),
                 TimeBar(blocks: blocks),
+                // UI-08（老大 04:59）：进度条下方一行一时间段+左侧色块与时间条同色（图例即行）
                 if (blocks.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 8),
-                    child: Wrap(
-                      spacing: 10,
-                      runSpacing: 4,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         for (final b in blocks)
-                          Text(
-                            '${b.isParallel ? "∥" : ""}${b.start}~${b.end} ${b.matterRef}',
-                            style: TextStyle(fontSize: 11, color: scheme.outline),
+                          Padding(
+                            padding: const EdgeInsets.only(top: 3),
+                            child: Row(children: [
+                              Container(
+                                width: 10,
+                                height: 10,
+                                margin: const EdgeInsets.only(right: 6),
+                                decoration: BoxDecoration(
+                                  color: TimeBar.colorOf(blocks, b),
+                                  borderRadius: BorderRadius.circular(3),
+                                ),
+                              ),
+                              Text(
+                                '${b.isParallel ? "∥ " : ""}${b.start}~${b.end} ${b.matterRef}',
+                                style: TextStyle(
+                                    fontSize: 11.5, height: 1.4),
+                              ),
+                            ]),
                           ),
                       ],
                     ),
@@ -167,6 +183,77 @@ class _TimelinePageState extends State<TimelinePage> {
         ),
         const SizedBox(height: 8),
 
+        // —— 闹铃（M-081：设置历史+响铃状态，跟日历切换日期）——
+        Builder(builder: (ctx) {
+          // 所选日期的闹钟（按应响时刻过滤）
+          final dayAlarms = app.alarmHistory.where((a) {
+            final w = DateTime.tryParse(a.wakeAt);
+            return w != null &&
+                '${w.month.toString().padLeft(2, '0')}-${w.day.toString().padLeft(2, '0')}' ==
+                    dateKey.substring(5); // dateKey=YYYY-MM-DD
+          }).toList();
+          // 待响的（未来时刻）也显示在当天
+          final upcoming = app.alarmHistory.where((a) {
+            final w = DateTime.tryParse(a.wakeAt);
+            return w != null && w.isAfter(DateTime.now());
+          }).toList();
+          final show = dayAlarms.isEmpty && upcoming.isNotEmpty && viewingToday
+              ? upcoming.take(3).toList()
+              : dayAlarms;
+          if (show.isEmpty) return const SizedBox.shrink();
+          return Card(
+            elevation: 0,
+            color: scheme.surfaceContainerLow,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Icon(Icons.alarm, size: 18, color: scheme.primary),
+                    const SizedBox(width: 6),
+                    Text(viewingToday ? '闹铃' : '$dateKey 的闹铃',
+                        style: const TextStyle(fontWeight: FontWeight.w600)),
+                  ]),
+                  const SizedBox(height: 6),
+                  for (final a in show)
+                    () {
+                      final w = DateTime.tryParse(a.wakeAt) ?? DateTime.now();
+                      final passed = DateTime.now().isAfter(w);
+                      final hm = '${w.hour.toString().padLeft(2, '0')}:${w.minute.toString().padLeft(2, '0')}';
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Row(children: [
+                          Icon(
+                            a.done
+                                ? Icons.check_circle
+                                : (passed ? Icons.error_outline : Icons.schedule),
+                            size: 15,
+                            color: a.done
+                                ? Colors.green
+                                : (passed ? scheme.error : scheme.primary),
+                          ),
+                          const SizedBox(width: 6),
+                          Text('$hm 响 · 铃声${a.slot}${a.wantBrief ? " · 晨报" : ""}',
+                              style: const TextStyle(fontSize: 12.5)),
+                          const Spacer(),
+                          if (a.userPhrase.isNotEmpty)
+                            Flexible(
+                              child: Text('「${a.userPhrase}」',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 10, color: scheme.outline)),
+                            ),
+                        ]),
+                      );
+                    }(),
+                ],
+              ),
+            ),
+          );
+        }),
+        const SizedBox(height: 8),
+
         // —— 四维状态 ——
         Card(
           elevation: 0,
@@ -180,8 +267,9 @@ class _TimelinePageState extends State<TimelinePage> {
                   children: [
                     Icon(Icons.bolt, size: 18, color: scheme.primary),
                     const SizedBox(width: 6),
-                    const Text('今日状态（四维电量）',
-                        style: TextStyle(fontWeight: FontWeight.w600)),
+                    Text(
+                        viewingToday ? '今日状态（四维电量）' : '$dateKey 的状态',
+                        style: const TextStyle(fontWeight: FontWeight.w600)),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -230,17 +318,58 @@ class _TimelinePageState extends State<TimelinePage> {
                 ),
                 const SizedBox(height: 4),
                 if (onMatters.isEmpty)
-                  Text('还没有在办事项——去沟通模式说一句"下周三要交报表"试试。',
+                  Text('还没有在办事项',
                       style: TextStyle(fontSize: 12, color: scheme.outline))
                 else
+                  // M-045 UI-01：独立卡片 + 属性默认收起（点行内小箭头展开）
                   for (final m in onMatters)
-                    ListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(m.name),
-                      subtitle: _matterSubtitle(m).isEmpty ? null : Text(_matterSubtitle(m), style: const TextStyle(fontSize: 11)),
-                      trailing: const Icon(Icons.chevron_right, size: 18),
-                      onTap: () => _showMatterDetail(context, app, m),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: GestureDetector(
+                        onLongPress: () => _manageMatter(context, app, m.id, m.name),
+                        child: Container(
+                        decoration: BoxDecoration(
+                          color: scheme.surfaceContainerHighest,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Theme(
+                          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                          child: ExpansionTile(
+                            dense: true,
+                            tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+                            childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                            title: Text(m.name,
+                                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+                            subtitle: Text(
+                              // 收起状态的一行摘要：只显示时间要求（最关键的信号）
+                              m.core.timeReq.isNotEmpty ? '⏰ ${m.core.timeReq}' : '点开看详情',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 11, color: scheme.outline),
+                            ),
+                            children: [
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  for (final line in _matterSubtitleLines(m))
+                                    Text(line,
+                                        style: const TextStyle(fontSize: 11, height: 1.6)),
+                                  const SizedBox(height: 4),
+                                  Align(
+                                    alignment: Alignment.centerRight,
+                                    child: TextButton.icon(
+                                      icon: const Icon(Icons.info_outline, size: 14),
+                                      label: const Text('完整详情', style: TextStyle(fontSize: 11)),
+                                      onPressed: () => _showMatterDetail(context, app, m),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      ),
                     ),
                 // —— 归档（仅名称）——
                 if (app.matters.any((m) => !m.active)) ...[
@@ -267,6 +396,77 @@ class _TimelinePageState extends State<TimelinePage> {
   }
 
   /// 事项详情弹窗（REQ-003"深入了解时才展开"的入口，M-017）
+  /// M-069：事项人工管理菜单（长按）
+  Future<void> _manageMatter(
+      BuildContext context, AppState app, String id, String name) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(name,
+                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.edit_outlined, size: 20),
+              title: const Text('改名', style: TextStyle(fontSize: 13)),
+              onTap: () => Navigator.pop(ctx, 'rename'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.check_circle_outline, size: 20),
+              title: const Text('归档（完成或搁置）', style: TextStyle(fontSize: 13)),
+              onTap: () => Navigator.pop(ctx, 'archive'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, size: 20, color: Colors.redAccent),
+              title: const Text('彻底删除', style: TextStyle(fontSize: 13, color: Colors.redAccent)),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !context.mounted) return;
+    switch (choice) {
+      case 'rename':
+        final c = TextEditingController(text: name);
+        final v = await showDialog<String>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('事项改名', style: TextStyle(fontSize: 16)),
+            content: TextField(controller: c, autofocus: true),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, c.text), child: const Text('保存')),
+            ],
+          ),
+        );
+        if (v != null && v.trim().isNotEmpty) await app.renameMatter(id, v.trim());
+      case 'archive':
+        await app.archiveMatter(id);
+      case 'delete':
+        final ok = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('彻底删除？'),
+            content: Text('「$name」将被删除（目标挂靠一并解除）。'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+              FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('删除'),
+              ),
+            ],
+          ),
+        );
+        if (ok == true) await app.deleteMatter(id);
+    }
+  }
+
   void _showMatterDetail(BuildContext context, AppState app, Matter m) {
     final scheme = Theme.of(context).colorScheme;
     showDialog(
@@ -462,13 +662,29 @@ class _TimelinePageState extends State<TimelinePage> {
     );
   }
 
-  String _matterSubtitle(Matter m) {
-    final parts = <String>[];
-    if (m.core.timeReq.isNotEmpty) parts.add('⏰${m.core.timeReq}');
-    if (m.core.energyReq.isNotEmpty) parts.add('⚡${m.core.energyReq}');
-    if (m.core.exclusive) parts.add('独占');
-    if (m.ext.isNotEmpty) parts.add(m.ext.entries.map((e) => '${e.key}:${e.value}').join(' '));
-    return parts.join(' · ');
+  /// M-041 属性分行展示（老大 03:47 反馈：堆一行混乱）——
+  /// 每类属性独立一行：内核三属性 + 掌握度 + 目标 + 扩展键值逐行
+  List<String> _matterSubtitleLines(Matter m) {
+    // M-042（老大 04:05）：内核属性一项一行——表达长不挤行
+    final lines = <String>[];
+    if (m.core.timeReq.isNotEmpty) lines.add('⏰ 时间：${m.core.timeReq}');
+    if (m.core.energyReq.isNotEmpty) lines.add('⚡ 精力：${m.core.energyReq}');
+    if (m.core.exclusive) lines.add('🔒 独占（需专注，不并行）');
+    final mastery = switch (m.core.mastery) {
+      'familiar' => '📖 掌握度：熟悉',
+      'average' => '📖 掌握度：一般',
+      'unfamiliar' => '📖 掌握度：生疏',
+      _ => '',
+    };
+    if (mastery.isNotEmpty) lines.add(mastery);
+    if (m.goalRef.isNotEmpty) {
+      final goal = widget.app.goals.where((g) => g.id == m.goalRef).firstOrNull;
+      if (goal != null) lines.add('🎯 目标：${goal.title}');
+    }
+    for (final e in m.ext.entries) {
+      lines.add('${e.key}：${e.value}');
+    }
+    return lines;
   }
 
   static String _todayStr() {
@@ -495,140 +711,219 @@ class _TimelinePageState extends State<TimelinePage> {
   }
 }
 
-/// M-035 空洞斜纹画笔：45° 细斜线，视觉上与实色块区分
-class _GapPainter extends CustomPainter {
-  final Color color;
-  const _GapPainter({required this.color});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = 1;
-    for (var x = -size.height; x < size.width; x += 5) {
-      canvas.drawLine(Offset(x, size.height), Offset(x + size.height, 0), paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _GapPainter oldDelegate) => color != oldDelegate.color;
-}
-
 /// 24 小时水平时间条：安排块着色 + 当前时间指示线
 class TimeBar extends StatelessWidget {
   final List<ScheduleBlock> blocks;
   const TimeBar({super.key, required this.blocks});
 
+  // UI-11（老大 16:21）：5 色→12 色——同日撞色基本消灭；色相轮转+深浅交错
+  // UI-11/14（老大两轮反馈）：5→12→24 色——一天 24 个事项不撞色
+  // UI-15（老大 19:01）：跳色排列——相邻编号强制不同色系（蓝↔橙↔紫↔绿↔红交替），
+  // 相邻事项对比度最大化；明度错开，同色系复活时也有深浅差。
   static const _palette = [
-    Color(0xFF3F6C51), // 绿
-    Color(0xFF4C6FA5), // 蓝
-    Color(0xFF9C6B9E), // 紫
-    Color(0xFFB07B3F), // 橙
-    Color(0xFF4F8A8B), // 青
+    Color(0xFF3D6EB4), // 1 蓝（亮）
+    Color(0xFFC4662A), // 2 橙（亮）——与1互补
+    Color(0xFF8E4AB8), // 3 紫
+    Color(0xFF3E9E52), // 4 绿（亮）
+    Color(0xFFC93A5E), // 5 红粉
+    Color(0xFF2E8C94), // 6 青
+    Color(0xFFA9842E), // 7 金
+    Color(0xFF5A5ED2), // 8 靛蓝（亮紫蓝）
+    Color(0xFF6E8C2E), // 9 黄绿
+    Color(0xFFB8547A), // 10 玫瑰
+    Color(0xFF2F7F5F), // 11 深绿松
+    Color(0xFF8C5E2E), // 12 棕橙
+    Color(0xFF4A6E9E), // 13 灰蓝
+    Color(0xFFD0783C), // 14 亮橙
+    Color(0xFF7A4C8C), // 15 深紫
+    Color(0xFF52B87E), // 16 薄荷绿
+    Color(0xFFCC4A44), // 17 砖红
+    Color(0xFF3A7A8C), // 18 钢青
+    Color(0xFFB8A03A), // 19 芥末
+    Color(0xFF6E5AB8), // 20 亮紫
+    Color(0xFF5E8C4A), // 21 橄榄
+    Color(0xFFE07090), // 22 浅玫瑰
+    Color(0xFF2E6E5E), // 23 墨绿
+    Color(0xFF9C7A4E), // 24 驼
   ];
+
+  /// UI-08：按事项名稳定取色（同名同色——下方列表的色块与时间条颜色严格一致）
+  static Color colorOf(List<ScheduleBlock> blocks, ScheduleBlock b) {
+    final names = blocks.map((x) => x.matterRef).toSet().toList();
+    final idx = names.indexOf(b.matterRef);
+    return _palette[(idx < 0 ? 0 : idx) % _palette.length];
+  }
+
+  /// UI-13：事项短名（前 4 字）——色块内嵌文字用
+  static String _shortName(String ref) {
+    if (ref.length <= 4) return ref;
+    return ref.substring(0, 4);
+  }
+
+  /// UI-14（老大 18:14）：点击色块看详情——起点/终点/时长/标题/理由/并行轨
+  void _showBlockDetail(BuildContext context, ScheduleBlock b) {
+    final dur = (b.endMinutes ?? 0) - (b.startMinutes ?? 0);
+    final durStr = dur >= 60
+        ? '${dur ~/ 60}小时${dur % 60 > 0 ? '${dur % 60}分' : ''}'
+        : '$dur分钟';
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(b.matterRef, style: const TextStyle(fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('起止：${b.start} ~ ${b.end}（$durStr）',
+                style: const TextStyle(fontSize: 13)),
+            if (b.isParallel)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text('并行轨 ${b.track}（与同时段其他事并行）',
+                    style: const TextStyle(fontSize: 12)),
+              ),
+            if (b.reason.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('安排理由：', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+              Text(b.reason, style: const TextStyle(fontSize: 12, height: 1.5)),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('关闭')),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     final now = DateTime.now();
     final nowMin = now.hour * 60 + now.minute;
 
     return LayoutBuilder(builder: (context, c) {
       final w = c.maxWidth;
 
+      // UI-12（老大 16:21）：双条——0~12 一条、12~24 一条，各撑满屏宽（块宽翻倍不拥挤）
       return Column(
         children: [
-          SizedBox(
-            height: 46,
-            child: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                // 底槽
-                Container(
-                  decoration: BoxDecoration(
-                    color: scheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
+          _halfBar(context, blocks, w,
+              fromMin: 0, toMin: 720, nowMin: nowMin, startLabel: '0时', midLabel: '6时', endLabel: '12时'),
+          const SizedBox(height: 6),
+          _halfBar(context, blocks, w,
+              fromMin: 720, toMin: 1440, nowMin: nowMin, startLabel: '12时', midLabel: '18时', endLabel: '24时'),
+        ],
+      );
+    });
+  }
+
+  /// 半天条（UI-12）：fromMin~toMin 共 720 分钟映射全宽
+  Widget _halfBar(BuildContext context, List<ScheduleBlock> blocks, double w,
+      {required int fromMin,
+      required int toMin,
+      required int nowMin,
+      required String startLabel,
+      required String midLabel,
+      required String endLabel}) {
+    final scheme = Theme.of(context).colorScheme;
+    final span = (toMin - fromMin).toDouble();
+
+    // 本半天的块（跨 12 点的块切两段：夹在本条内的部分，同色延续）
+    final visible = <(ScheduleBlock, int, int)>[];
+    for (final b in blocks) {
+      final s = b.startMinutes;
+      final e = b.endMinutes;
+      if (s == null || e == null || e <= s) continue;
+      final cs = s < fromMin ? fromMin : s; // clip 到本条
+      final ce = e > toMin ? toMin : e;
+      if (ce > cs) visible.add((b, cs, ce));
+    }
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 42,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              // 底槽
+              Container(
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(8),
                 ),
-                // M-035 空洞高亮：主轨未覆盖时段画斜纹条（一眼看到"时间哪去了"）
-                for (final (gs, ge) in AppState.uncoveredGaps(blocks))
-                  () {
-                    final left = gs / 1440.0 * w;
-                    final width = (ge - gs) / 1440.0 * w;
-                    return Positioned(
-                      left: left,
-                      width: width,
-                      top: 4,
-                      bottom: 4,
+              ),
+              // 安排块
+              for (final (b, cs, ce) in visible)
+                () {
+                  final left = (cs - fromMin) / span * w;
+                  final width = (ce - cs) / span * w;
+                  final isParallel = b.isParallel;
+                  final canShowText = width > 28; // UI-14：阈值放宽（双条后更多块能放字）
+                  return Positioned(
+                    left: left,
+                    width: width,
+                    top: isParallel ? 42 - 4 - 11 - (b.track - 1) * 5 : 4,
+                    bottom: isParallel ? 4 + (b.track - 1) * 5 : 4,
+                    // UI-14（老大 18:14）：块可点——窄块放不下字也能点开看
+                    // 起点/终点/事项标题/理由详情
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _showBlockDetail(context, b),
                       child: Tooltip(
-                        message: '${AppState.fmtMin(gs)}~${AppState.fmtMin(ge)} 未记录',
-                        child: CustomPaint(
-                          painter: _GapPainter(color: scheme.outline.withOpacity(0.25)),
-                          size: Size(width, 38),
+                      message:
+                          '${isParallel ? "[并行·轨${b.track}] " : ""}${b.start}~${b.end} ${b.matterRef}\n${b.reason}',
+                      child: Container(
+                        alignment: Alignment.center,
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        decoration: BoxDecoration(
+                          color: colorOf(blocks, b)
+                              .withOpacity(isParallel ? 0.55 : 1.0),
+                          borderRadius: BorderRadius.circular(isParallel ? 3 : 5),
+                          border: isParallel
+                              ? Border.all(color: scheme.outline.withOpacity(0.4), width: 0.5)
+                              : null,
                         ),
+                        child: canShowText
+                            ? FittedBox(
+                                // UI-13：块内嵌事项短名（≤4字），自适应缩放
+                                fit: BoxFit.scaleDown,
+                                child: Text(
+                                  _shortName(b.matterRef),
+                                  maxLines: 1,
+                                  style: TextStyle(
+                                      fontSize: isParallel ? 8 : 10,
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w500),
+                                ),
+                              )
+                            : null,
                       ),
-                    );
-                  }(),
-                // 安排块（M-034 多轨：主轨占满条高；伴随轨细条贴底、半透明）
-                for (var i = 0; i < blocks.length; i++)
-                  () {
-                    final b = blocks[i];
-                    final s = b.startMinutes;
-                    final e = b.endMinutes;
-                    if (s == null || e == null || e <= s) return const SizedBox.shrink();
-                    final left = s / 1440.0 * w;
-                    final width = (e - s) / 1440.0 * w;
-                    final isParallel = b.isParallel;
-                    return Positioned(
-                      left: left,
-                      width: width,
-                      // 主轨满高；伴随轨：底部 1/3 细条，多伴随轨逐级上移（罕见）
-                      top: isParallel ? 46 - 4 - 12 - (b.track - 1) * 5 : 4,
-                      bottom: isParallel ? 4 + (b.track - 1) * 5 : 4,
-                      child: Tooltip(
-                        message:
-                            '${isParallel ? "[并行·轨${b.track}] " : ""}${b.start}~${b.end} ${b.matterRef}\n${b.reason}',
-                        child: Container(
-                          alignment: Alignment.center,
-                          padding: const EdgeInsets.symmetric(horizontal: 3),
-                          decoration: BoxDecoration(
-                            color: _palette[i % _palette.length]
-                                .withOpacity(isParallel ? 0.55 : 1.0),
-                            borderRadius: BorderRadius.circular(isParallel ? 3 : 5),
-                            border: isParallel
-                                ? Border.all(color: scheme.outline.withOpacity(0.4), width: 0.5)
-                                : null,
-                          ),
-                          child: Text(
-                            b.matterRef,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                                fontSize: isParallel ? 7.5 : 9, color: Colors.white),
-                          ),
-                        ),
                       ),
-                    );
-                  }(),
-                // 当前时间线
+                    ),
+                  );
+                }(),
+              // 当前时间线（仅当天条内且在本半条范围时显示）
+              if (nowMin >= fromMin && nowMin < toMin)
                 Positioned(
-                  left: nowMin / 1440.0 * w - 1,
+                  left: (nowMin - fromMin) / span * w - 1,
                   top: -2,
                   bottom: -2,
                   child: Container(width: 2, color: scheme.error),
                 ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 2),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              for (final h in [0, 6, 12, 18, 24]) Text('$h时', style: const TextStyle(fontSize: 9)),
             ],
           ),
-        ],
-      );
-    });
+        ),
+        const SizedBox(height: 2),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(startLabel, style: const TextStyle(fontSize: 9)),
+            Text(midLabel, style: const TextStyle(fontSize: 9)),
+            Text(endLabel, style: const TextStyle(fontSize: 9)),
+          ],
+        ),
+      ],
+    );
   }
 }

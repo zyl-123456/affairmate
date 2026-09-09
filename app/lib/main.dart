@@ -1,3 +1,4 @@
+import 'dart:io';
 // 主入口与双模式界面 · 事务伴侣
 // 对应设计：D-006（双模式切换即两个页面，共享同一会话状态）
 
@@ -8,9 +9,12 @@ import 'package:path_provider/path_provider.dart';
 
 import 'app_state_scope.dart';
 import 'data/repo.dart';
+import 'data/usage_log.dart';
+import 'platform/power_service.dart';
+import 'llm/alarm_player.dart';
 import 'llm/notify.dart';
-import 'llm/sprite.dart';
 import 'llm/voice.dart';
+import 'pages/goals_page.dart';
 import 'pages/playbook_page.dart';
 import 'pages/timeline_page.dart';
 import 'pages/settings_page.dart';
@@ -115,18 +119,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this); // M-037a 前后台侦测
-    NotifyService.init(); // 通知初始化（安卓）
+    NotifyService.init();
+    UsageLog.init(); // M-064 使用日志
+    // M-070：电池优化豁免引导（黑屏断网的根治——仅一次）
+    _maybeAskBatteryExemption(context);
+    // M-060/080 晨报+闹钟触发：10 秒粒度轮询（原 1 分钟——老大要求误差<1 分钟）
+    Timer.periodic(const Duration(seconds: 10), (_) {
+      final app = InheritedAppState.maybeOf(context);
+      if (app != null && app.morningBriefDue && !app.sending) {
+        app.runMorningBrief();
+      }
+    }); // 通知初始化（安卓）
     NotifyService.onTapNavigate = (mode) {
       // 点通知跳对应会话页（App 可能冷启动，navigate 回调在 build 后消费）
       if (!mounted) return;
       setState(() => _tab = mode == 'arrange' ? 1 : 0);
+      // M-055：程序内切模式也滚底
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_chatScroll.hasClients) {
+          _chatScroll.jumpTo(_chatScroll.position.maxScrollExtent);
+        }
+      });
     };
-    // M-037b：精灵初始化 + 转写文本 → 复用完整发送链路
-    SpriteController.init();
-    SpriteController.onSpriteMessage = (text, arrange) {
-      final app = InheritedAppState.maybeOf(context);
-      app?.send(text, arrangeMode: arrange);
-    };
+
     _voice.addListener(() => setState(() {})); // 语音状态变化刷新输入区
     _gapTimer = Timer.periodic(const Duration(minutes: 2), (_) {
       if (!mounted) return;
@@ -171,11 +186,55 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  @override
+  /// M-070：首次启动引导电池优化豁免（用户点允许后永不再弹）
+  Future<void> _maybeAskBatteryExemption(BuildContext ctx) async {
+    try {
+      // 标记文件（与 providers.json 同目录——项目无 SharedPreferences，用文件即够）
+      final doc = await getApplicationDocumentsDirectory();
+      final flag = File('${doc.path}${Platform.pathSeparator}battery_exempt.flag');
+      if (flag.existsSync()) return;
+      final exempted = await PowerService.isExempted();
+      if (exempted) {
+        flag.writeAsStringSync('done');
+        return;
+      }
+      await Future.delayed(const Duration(milliseconds: 800)); // 等 UI 稳定
+      if (!mounted) return;
+      final ok = await showDialog<bool>(
+        context: ctx,
+        builder: (d) => AlertDialog(
+          title: const Text('最后一步：允许后台联网', style: TextStyle(fontSize: 16)),
+          content: const Text(
+            '不黑屏等待回复时断网，需要关闭本应用的电池优化（微信收消息同款待遇）。\n\n点"去设置"后在系统弹窗里选"允许"。电池影响很小（只在等回复的几十秒保持连接）。',
+            style: TextStyle(fontSize: 13, height: 1.6),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('下次再说')),
+            FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('去设置')),
+          ],
+        ),
+      );
+      if (ok == true) {
+        await PowerService.requestExempt();
+        // 用户去点了设置——下次启动验证；这里先不写 flag，让验证生效后静默记录
+      }
+      // 无论这回点没点，下次启动再查（已豁免则静默记录不再弹）
+    } catch (_) {}
+  }
+
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // M-037a：后台标记——后台收到的回复才弹系统通知（前台不打扰）
     NotifyService.appInBackground =
         state == AppLifecycleState.paused || state == AppLifecycleState.hidden;
+    if (state == AppLifecycleState.resumed) {
+      // M-063：回前台先停响铃（用户醒了）
+      AlarmPlayer.stop();
+      // M-060：检查晨报到期
+      final app = InheritedAppState.maybeOf(context);
+      if (app != null && app.morningBriefDue && !app.sending) {
+        app.runMorningBrief();
+      }
+    }
   }
 
   /// 聊天有新消息时滚到底部（M-012：回复不再跑到屏幕外）
@@ -199,6 +258,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ('安排', Icons.event_note_outlined),
       ('展示', Icons.view_timeline_outlined),
       ('懂我', Icons.auto_stories_outlined), // M-032 个人说明书页（REQ-014）
+      ('目标', Icons.flag_outlined), // M-039 目标页（大局观）
     ];
 
     return AnimatedBuilder(
@@ -206,7 +266,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       builder: (context, _) {
         // 双模式独立会话（M-024）：当前模式的会话才参与滚底侦测与渲染
         final session = _tab == 1 ? app.chatArrange : app.chatChat;
-        final chatLen = session.length;
+        // M-046：流式预览也算"新消息"触发滚底（逐字到达时跟着滚）
+        final chatLen = session.length +
+            ((app.sending && app.streamingPreview.isNotEmpty) ? 1 : 0);
         if (chatLen != _lastChatLen) {
           _lastChatLen = chatLen;
           _scrollChatToBottom(app); // 新消息（含 AI 回复）自动滚底
@@ -287,6 +349,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: switch (_tab) {
                   2 => TimelinePage(app: app),
                   3 => const PlaybookPage(), // M-032 懂我页
+                  4 => const GoalsPage(), // M-039 目标页
                   _ => _buildChat(app, arrangeMode: _tab == 1),
                 },
               ),
@@ -294,7 +357,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
           bottomNavigationBar: NavigationBar(
             selectedIndex: _tab,
-            onDestinationSelected: (i) => setState(() => _tab = i),
+            onDestinationSelected: (i) {
+              setState(() => _tab = i);
+              // M-055（老大 04:40）：切到沟通/安排即显示最新消息
+              if (i == 0 || i == 1) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (_chatScroll.hasClients) {
+                    _chatScroll.jumpTo(_chatScroll.position.maxScrollExtent);
+                  }
+                });
+              }
+            },
             destinations: [
               for (final (label, icon) in tabs)
                 NavigationDestination(icon: Icon(icon), label: label),
@@ -306,16 +379,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Widget _buildChat(AppState app, {required bool arrangeMode}) {
-    final session = arrangeMode ? app.chatArrange : app.chatChat;
+    var session = arrangeMode ? app.chatArrange : app.chatChat;
+    // M-055（老大 04:40）：前端只渲染最近 30 条——更早的不显示（历史仍在盘上可备份导出）
+    const maxShown = 30;
+    if (session.length > maxShown) {
+      session = session.sublist(session.length - maxShown);
+    }
+    // M-046：流式预览到达时列表多一项（实时逐字气泡）
+    final showStreamBubble =
+        app.sending && app.streamingPreview.isNotEmpty && (_tab == 1) == arrangeMode;
+    final itemCount = session.length + (showStreamBubble ? 1 : 0);
     return Column(
       children: [
         Expanded(
-          child: session.isEmpty
+          child: itemCount == 0
               ? Center(
                   child: Text(
-                    arrangeMode
-                        ? '说说你想要什么安排，例如：\n"安排我接下来两小时"\n"明天上午怎么安排"'
-                        : '随便聊聊你今天的事和状态，例如：\n"下周三要交报表"\n"昨晚没睡好，有点累"',
+                    arrangeMode ? '说说你要安排什么' : '说说你的事和状态',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.grey.shade500, height: 1.8),
                   ),
@@ -323,8 +403,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               : ListView.builder(
                   controller: _chatScroll,
                   padding: const EdgeInsets.all(12),
-                  itemCount: session.length,
-                  itemBuilder: (_, i) => _bubble(context, session[i]),
+                  itemCount: itemCount,
+                  itemBuilder: (_, i) {
+                    if (i == session.length && showStreamBubble) {
+                      // M-046 流式气泡：AI 正在生成的原文逐字显示
+                      return _bubble(
+                        context,
+                        ChatMsg(app.streamingPreview), // 临时气泡（无 sideLog）
+                      );
+                    }
+                    return _bubble(context, session[i]);
+                  },
                 ),
         ),
         if (app.sending)
@@ -366,6 +455,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ),
                 const SizedBox(width: 8),
                 _micButton(app, arrangeMode),
+                // M-039 录音取消（老大 02:41 反馈）：录音中出 ✕，点了丢弃这段录音
+                if (_voice.isListening) ...[
+                  const SizedBox(width: 4),
+                  GestureDetector(
+                    onTap: () => _voice.cancel(),
+                    child: Container(
+                      width: 36,
+                      height: 36,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                      ),
+                      child: Icon(Icons.close,
+                          size: 18,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant),
+                    ),
+                  ),
+                ],
                 const SizedBox(width: 8),
                 IconButton.filled(
                   onPressed: app.sending ? null : () => _send(app, arrangeMode),
@@ -468,7 +575,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(
+            SelectableText(
+              // M-050（老大 22:00）：长按可复制——用户/AI 消息都支持
               m.text,
               style: TextStyle(
                 color: isUser ? Colors.white : scheme.onSurface,
@@ -490,6 +598,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         ),
                       ),
                   ],
+                ),
+              ),
+            // M-058/062：脚注——时刻（每条都有）+ token 用量（AI 回复）
+            if (m.at.isNotEmpty ||
+                (!isUser && (m.promptTokens > 0 || m.completionTokens > 0)))
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  [
+                    if (m.at.isNotEmpty) m.at,
+                    if (!isUser &&
+                        (m.promptTokens > 0 || m.completionTokens > 0))
+                      '↑${m.promptTokens} ↓${m.completionTokens} tokens',
+                  ].join(' · '),
+                  style: TextStyle(
+                    fontSize: 9,
+                    color: isUser ? Colors.white70 : scheme.outline,
+                  ),
                 ),
               ),
           ],

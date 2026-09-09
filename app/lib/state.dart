@@ -3,29 +3,84 @@
 // M-009：schedule 持久化（按日期分桶，重启恢复今日）+ clientFactory 测试注入点
 // M-011：聊天历史持久化（chat.json 截尾 200 条）+ 对话上下文滑窗入报文
 
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../data/models.dart';
 import '../data/profile.dart';
 import '../data/repo.dart';
 import '../data/safe_io.dart';
+import '../data/usage_log.dart';
+import '../llm/alarm_player.dart';
+import '../llm/audio_store.dart';
 import '../llm/notify.dart';
+import '../llm/prompt.dart';
 import '../llm/providers.dart';
 
 /// 聊天界面的一条消息
+/// M-081：闹钟历史记录（展示页闹铃卡片的数据）
+class AlarmRecord {
+  final String setAt; // 设置时刻 ISO
+  final String wakeAt; // 应响时刻 ISO
+  final int slot; // 铃声槽位
+  final bool wantBrief; // 是否晨报
+  final String userPhrase; // 用户原话
+  final bool done; // 已响过（到点触发过=打勾）
+
+  const AlarmRecord({
+    required this.setAt,
+    required this.wakeAt,
+    this.slot = 1,
+    this.wantBrief = false,
+    this.userPhrase = '',
+    this.done = false,
+  });
+
+  factory AlarmRecord.fromJson(Map<String, dynamic> j) => AlarmRecord(
+        setAt: (j['set_at'] ?? '').toString(),
+        wakeAt: (j['wake_at'] ?? '').toString(),
+        slot: (j['slot'] as num?)?.toInt() ?? 1,
+        wantBrief: j['want_brief'] == true,
+        userPhrase: (j['user_phrase'] ?? '').toString(),
+        done: j['done'] == true,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'set_at': setAt,
+        'wake_at': wakeAt,
+        'slot': slot,
+        'want_brief': wantBrief,
+        'user_phrase': userPhrase,
+        'done': done,
+      };
+}
+
 class ChatMsg {
   final String text;
   final bool fromUser;
   final List<String> sideLog; // 库变更摘要（给用户看的透明度）
+  final int promptTokens; // 本轮输入 token（M-058）
+  final int completionTokens; // 本轮输出 token（M-058）
+  final String at; // 消息时刻 HH:mm（M-062：每条消息显示发送/接收时间）
 
-  const ChatMsg(this.text, {this.fromUser = false, this.sideLog = const []});
+  const ChatMsg(this.text,
+      {this.fromUser = false,
+      this.sideLog = const [],
+      this.promptTokens = 0,
+      this.completionTokens = 0,
+      this.at = ''});
 
   Map<String, dynamic> toJson() => {
         'text': text,
         'from_user': fromUser,
         'side_log': sideLog,
+        if (promptTokens > 0) 'prompt_tokens': promptTokens,
+        if (completionTokens > 0) 'completion_tokens': completionTokens,
+        if (at.isNotEmpty) 'at': at,
       };
 
   factory ChatMsg.fromJson(Map<String, dynamic> j) => ChatMsg(
@@ -34,6 +89,9 @@ class ChatMsg {
         sideLog: ((j['side_log'] as List?) ?? [])
             .map((e) => e.toString())
             .toList(growable: false),
+        promptTokens: (j['prompt_tokens'] as int?) ?? 0,
+        completionTokens: (j['completion_tokens'] as int?) ?? 0,
+        at: (j['at'] ?? '').toString(),
       );
 }
 
@@ -55,6 +113,7 @@ class AppState extends ChangeNotifier {
   List<StateDay> stateDays = [];
   List<ScheduleBlock> schedule = []; // 今日安排块
   UserPlaybook playbook = const UserPlaybook(); // 个人说明书（底色层，M-032）
+  List<Goal> goals = []; // 目标账本（M-039）
 
   // 双模式独立会话（M-024 老大裁决 B 方案）：沟通/安排各自窗口，互不污染
   List<ChatMsg> chatChat = []; // 沟通模式会话
@@ -65,6 +124,80 @@ class AppState extends ChangeNotifier {
   String? activeProviderId;
   bool sending = false;
   String? error;
+  String streamingPreview = ''; // M-046 流式预览
+  int _lastPromptTokens = 0; // M-058：本轮输入 token
+  int _lastCompletionTokens = 0; // M-058：本轮输出 token
+  // M-060 晨报：醒来时刻（App 内持久化小文件）+ 今日晨报是否已发
+  DateTime? _wakeAt;
+  Timer? _alarmTimer; // M-080：秒级直达闹钟（不等分钟轮询）
+  int alarmSlot = 1; // M-061b：本次闹钟用的铃声槽位（对话可选，默认1）
+  bool _wakeWantBrief = true; // M-063：醒时要不要晨报（"纯叫我"场景=false）
+  static int _goalIdSeq = 0; // M-074：目标 id 防碰撞序号
+  bool _isRemedyRound = false; // M-076 V1：补救轮标记（防无限递归）
+  List<AlarmRecord> alarmHistory = []; // M-081：闹钟历史（展示页卡片）
+  File get _alarmLogFile =>
+      File('${repo.mattersFile.parent.path}${Platform.pathSeparator}alarm_log.json');
+
+  void _loadAlarmHistory() {
+    try {
+      if (_alarmLogFile.existsSync()) {
+        final j = jsonDecode(_alarmLogFile.readAsStringSync());
+        if (j is List) {
+          alarmHistory = j
+              .whereType<Map>()
+              .map((m) => AlarmRecord.fromJson(Map<String, dynamic>.from(m)))
+              .toList();
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _saveAlarmHistory() {
+    try {
+      // 保留最近 200 条
+      if (alarmHistory.length > 200) {
+        alarmHistory = alarmHistory.sublist(alarmHistory.length - 200);
+      }
+      _alarmLogFile.writeAsStringSync(jsonEncode(alarmHistory.map((a) => a.toJson()).toList()));
+    } catch (_) {}
+  }
+
+  /// M-081：记录一次闹钟设置
+  void _logAlarm(String userPhrase) {
+    if (_wakeAt == null) return;
+    alarmHistory.add(AlarmRecord(
+      setAt: DateTime.now().toIso8601String(),
+      wakeAt: _wakeAt!.toIso8601String(),
+      slot: alarmSlot,
+      wantBrief: _wakeWantBrief,
+      userPhrase: userPhrase.length > 40 ? userPhrase.substring(0, 40) : userPhrase,
+    ));
+    _saveAlarmHistory();
+  }
+
+  /// M-081：到点触发后打勾
+  void markAlarmDone() {
+    var changed = false;
+    for (var i = 0; i < alarmHistory.length; i++) {
+      final a = alarmHistory[i];
+      final wake = DateTime.tryParse(a.wakeAt);
+      if (!a.done && wake != null && DateTime.now().isAfter(wake)) {
+        alarmHistory[i] = AlarmRecord(
+          setAt: a.setAt, wakeAt: a.wakeAt, slot: a.slot,
+          wantBrief: a.wantBrief, userPhrase: a.userPhrase, done: true);
+        changed = true;
+      }
+    }
+    if (changed) _saveAlarmHistory();
+  }
+  // 测试注入：测试环境禁用 wakelock（无平台通道会崩）
+  static bool _wakelockCapable = true;
+  @visibleForTesting
+  static set wakelockCapable(bool v) => _wakelockCapable = v;
+  // M-065 goal delete：applyGoalOps 内直接改 matters（上面已做）
+  String get _wakeAtFile =>
+      '${repo.mattersFile.parent.path}${Platform.pathSeparator}wake.json';
+  bool _briefSentToday = false;
 
   AppState(this.repo, {File? scheduleFile, File? chatFile, this.clientFactory})
       : scheduleFile = scheduleFile ??
@@ -73,6 +206,10 @@ class AppState extends ChangeNotifier {
             File('${repo.mattersFile.parent.path}${Platform.pathSeparator}chat.json') {
     matters = repo.loadMatters();
     stateDays = repo.loadState();
+    goals = repo.loadGoals(); // M-039
+    _loadWakeState(); // M-060
+    _loadAlarmHistory(); // M-081
+    _dedupeGoalIds(); // M-074：存量同 id 目标重分配（历史碰撞数据自愈）
     schedule = _loadScheduleFor(today());
     _loadChats();
     // M-033 总档案（合并结构，含旧 playbook 自动迁移）
@@ -122,6 +259,544 @@ class AppState extends ChangeNotifier {
   /// 复盘周期（天）——设置项可调（老大 2026-09-06 裁决），默认 10。
   int reviewCycleDays = 10;
 
+  /// 测试入口（M-040 e2e）：应用并回写内存（模拟 send() 路径行为）
+  (List<Goal>, List<String>) applyGoalOpsForTest(List<GoalOp> ops) {
+    final r = _applyGoalOps(ops);
+    goals = r.$1;
+    return r;
+  }
+
+  // ============ M-060 晨报机制 ============
+
+  /// M-074：修复历史 ID 碰撞——同 id 多目标时保留第一个，其余重分配唯一 id
+  void _dedupeGoalIds() {
+    final seen = <String>{};
+    var changed = false;
+    goals = goals.map((g) {
+      if (seen.contains(g.id)) {
+        changed = true;
+        return g.copyWith(
+            id: 'g_${DateTime.now().millisecondsSinceEpoch}_${_goalIdSeq++}_fix',
+            updatedAt: DateTime.now().toIso8601String());
+      }
+      seen.add(g.id);
+      return g;
+    }).toList();
+    if (changed) repo.saveGoals(goals);
+  }
+
+  void _loadWakeState() {
+    try {
+      final f = File(_wakeAtFile);
+      if (f.existsSync()) {
+        final j = jsonDecode(f.readAsStringSync());
+        if (j is Map) {
+          _wakeAt = DateTime.tryParse((j['wake_at'] ?? '').toString());
+          final lastBrief = (j['brief_date'] ?? '').toString();
+          _briefSentToday = lastBrief == today();
+          _scheduleExactRing(); // M-080：重启后恢复秒级直达
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _saveWakeState() {
+    try {
+      File(_wakeAtFile).writeAsStringSync(jsonEncode({
+        'wake_at': _wakeAt?.toIso8601String() ?? '',
+        'brief_date': _briefSentToday ? today() : '',
+      }));
+    } catch (_) {}
+  }
+
+  /// 睡眠/闹钟意图识别（M-063 分级）：
+  /// "叫醒我/叫我/闹钟/提醒" → 纯闹钟（响铃即止，不出晨报）
+  /// "我要睡了/休息" → 睡眠（响铃+晨报+规划）
+  /// 返回：none / alarmOnly / sleepBrief
+  Future<String> detectSleepIntent(String text) async {
+    final t = text;
+    // 匹配"睡到 HH点/H点" 或 "睡 N 个小时/小时" 或 "睡 N 分钟"（M-061b 午睡）
+    // M-062：中文数字归一化（一→1 两/二→2 三→3…半→0.5）——"睡一分钟/睡半小时"能认
+    final normalized = t
+        .replaceAllMapped(RegExp(r'[一二两三四五六七八九十半]'), (m) {
+          const cn = {'一': '1', '二': '2', '两': '2', '三': '3', '四': '4', '五': '5',
+                      '六': '6', '七': '7', '八': '8', '九': '9', '十': '10', '半': '0.5'};
+          return cn[m.group(0)]!;
+        });
+    final wakeMatch = RegExp(r'睡到[^0-9.]*(\d{1,2})[点时:：]').firstMatch(normalized);
+    final durMatch =
+        RegExp(r'睡[^0-9.]*(\d{1,3}(?:\.\d)?)\s*[个]?[小]?时').firstMatch(normalized);
+    final minMatch = RegExp(r'睡[^0-9.]*(\d{1,4})\s*分钟?').firstMatch(normalized);
+    // M-077（老大 19:28 日志破案）：闹钟句不带"睡"字也要能触发——
+    // "设一个三分钟之后的闹钟"/"N分钟后叫我/提醒我"
+    // M-078b：回补日志点名的漏网模式——"设定一个5分钟之后的闹钟"（数字前有"个"等量词噪声）、
+    // "睡8个小时"（"个小时"口径）。取最后一个数字段为准（避免"一个5分钟"吃到"1"）。
+    final hasAlarmWord = normalized.contains('闹钟') ||
+        normalized.contains('叫') ||
+        normalized.contains('提醒');
+    final alarmMinMatch = hasAlarmWord || normalized.contains('睡')
+        ? RegExp(r'(\d{1,4})\s*分钟').firstMatch(normalized)
+        : null;
+    final alarmHourMatch = hasAlarmWord || normalized.contains('睡')
+        ? RegExp(r'(\d{1,2})\s*[个]?小时').firstMatch(normalized)
+        : null;
+    // M-061b：可选铃声槽位（"用铃声3"/"用3号铃声"/"铃声2叫我"）
+    final slotMatch =
+        RegExp(r'铃声\s*([1-4])|([1-4])\s*号铃声').firstMatch(t);
+    if (slotMatch != null) {
+      alarmSlot = int.parse(slotMatch.group(1) ?? slotMatch.group(2)!);
+    }
+    final hasTime = wakeMatch != null ||
+        durMatch != null ||
+        minMatch != null ||
+        alarmMinMatch != null ||
+        alarmHourMatch != null;
+    if (!hasTime) return 'none';
+    // M-079 晨报显式制（老大 02:31 裁决，废弃 M-066 时长分级猜语义）：
+    // 唤醒意图的表达里出现"晨报"二字 → 出晨报；没有 → 一律纯闹钟。
+    // 判定从"猜"变"认死理"——零误判，代价是用户要记得说"晨报"俩字。
+    final sleepWord = normalized.contains('睡') || normalized.contains('休息');
+
+    if (normalized.contains('晨报')) {
+      _wakeWantBrief = true; // 显式要求晨报
+    } else {
+      _wakeWantBrief = false; // 没提晨报 = 纯闹钟（哪怕是整夜睡眠）
+    }
+    // 保留意图词校验：既非睡眠词也无闹钟词则不触发（防误伤普通消息）
+    final alarmWord = normalized.contains('叫醒') ||
+        normalized.contains('叫我') ||
+        normalized.contains('闹钟') ||
+        normalized.contains('提醒我') ||
+        normalized.contains('响铃通知') ||
+        normalized.contains('测试');
+    if (!sleepWord && !alarmWord) {
+      return 'none';
+    }
+
+    DateTime wake;
+    final now = DateTime.now();
+    if (wakeMatch != null) {
+      final h = int.parse(wakeMatch.group(1)!) % 24;
+      wake = DateTime(now.year, now.month, now.day, h);
+      if (!wake.isAfter(now)) wake = wake.add(const Duration(days: 1)); // 已过=明早
+    } else if (minMatch != null) {
+      wake = now.add(Duration(minutes: int.parse(minMatch.group(1)!)));
+    } else if (alarmMinMatch != null) {
+      wake = now.add(Duration(minutes: int.parse(alarmMinMatch.group(1)!)));
+    } else if (alarmHourMatch != null) {
+      wake = now.add(Duration(hours: int.parse(alarmHourMatch.group(1)!)));
+    } else {
+      final hours = double.parse(durMatch!.group(1)!);
+      wake = now.add(Duration(minutes: (hours * 60).round()));
+    }
+    _wakeAt = wake;
+    _briefSentToday = false; // 新睡眠周期：下次醒时再触发
+    _saveWakeState();
+    await NotifyService.cancelMorningBrief();
+    await NotifyService.scheduleMorningBrief(wake);
+    _scheduleExactRing(); // M-080：秒级直达
+    _logAlarm(text); // M-081：入历史
+    return _wakeWantBrief ? 'sleepBrief' : 'alarmOnly';
+  }
+  // M-066 意图判定结束
+
+  /// M-080：排秒级直达闹钟——到点直接响铃（不等 10 秒轮询，更不等被冻结的周期器）
+  void _scheduleExactRing() {
+    _alarmTimer?.cancel();
+    if (_wakeAt == null) return;
+    final delay = _wakeAt!.difference(DateTime.now());
+    if (delay.isNegative || delay.inSeconds > 24 * 3600) return; // 已过/超远不排
+    _alarmTimer = Timer(delay, () {
+      if (morningBriefDue) runMorningBrief();
+    });
+  }
+
+  /// 到达醒时且今日未发 → 自动触发晨报（main 层定时/App 生命周期回调调用）
+  bool get morningBriefDue {
+    if (_wakeAt == null || _briefSentToday || !_wakeWantBrief) return false;
+    final now = DateTime.now();
+    // M-085：醒时已过 2 小时仍未触发=陈旧记录（跨天残留/已响过的旧账）——
+    // 清掉不触发（幽灵晨报根治：昨晚的闹钟不能在今天凌晨诈尸）
+    if (now.difference(_wakeAt!) > const Duration(hours: 2)) {
+      _wakeAt = null;
+      _saveWakeState();
+      return false;
+    }
+    return now.isAfter(_wakeAt!);
+  }
+
+  /// 到点执行：响铃（播放器循环响）+ 按意图决定是否晨报
+  Future<void> runMorningBrief() async {
+    if (!morningBriefDue) return;
+    _briefSentToday = true; // 先标记防重入
+    _saveWakeState();
+    markAlarmDone(); // M-081：到点触发 → 历史打勾
+    // M-063：播放器直接响（循环直到停）+ 全屏通知（视觉）
+    String? s;
+    try {
+      s = await AudioStore.slotPath(alarmSlot) ?? await AudioStore.slotPath(1);
+    } catch (_) {}
+    await AlarmPlayer.start(s);
+    await NotifyService.showAlarm(
+      title: _wakeWantBrief ? '该醒了' : '时间到',
+      body: _wakeWantBrief ? '晨报正在生成——今天的安排马上就好' : '你定的闹钟到了',
+    );
+    if (!_wakeWantBrief) return; // 纯闹钟：响完就完
+    try {
+      await send(kMorningBriefUserMessage, arrangeMode: true);
+    } catch (e) {
+      _briefSentToday = false; // 失败回滚，下次再试
+      _saveWakeState();
+      UsageLog.err('ALARM', '晨报生成失败（回滚待重试）：$e');
+      notifyListeners();
+    }
+  }
+
+  // ============ M-065 目标人工管理（长按菜单）============
+
+  Future<void> renameGoal(String id, String title) async {
+    final i = goals.indexWhere((g) => g.id == id);
+    if (i < 0) return;
+    goals[i] = goals[i].copyWith(title: title, updatedAt: DateTime.now().toIso8601String());
+    repo.saveGoals(goals);
+    notifyListeners();
+  }
+
+  Future<void> archiveGoal(String id) async {
+    final i = goals.indexWhere((g) => g.id == id);
+    if (i < 0) return;
+    goals[i] = goals[i].copyWith(active: false, updatedAt: DateTime.now().toIso8601String());
+    repo.saveGoals(goals);
+    notifyListeners();
+  }
+
+  Future<void> restoreGoal(String id) async {
+    final i = goals.indexWhere((g) => g.id == id);
+    if (i < 0) return;
+    goals[i] = goals[i].copyWith(active: true, updatedAt: DateTime.now().toIso8601String());
+    repo.saveGoals(goals);
+    notifyListeners();
+  }
+
+  Future<void> deleteGoal(String id) async {
+    goals = goals.where((g) => g.id != id).toList();
+    matters = matters.map((m) => m.goalRef == id ? m.copyWith(goalRef: '') : m).toList();
+    repo.saveGoals(goals);
+    repo.saveMatters(matters);
+    notifyListeners();
+  }
+
+  // ============ M-069 事项人工管理（长按菜单）============
+
+  Future<void> renameMatter(String id, String name) async {
+    final i = matters.indexWhere((m) => m.id == id);
+    if (i < 0) return;
+    matters[i] = matters[i].copyWith(name: name, updatedAt: DateTime.now().toIso8601String());
+    repo.saveMatters(matters);
+    notifyListeners();
+  }
+
+  Future<void> archiveMatter(String id) async {
+    final i = matters.indexWhere((m) => m.id == id);
+    if (i < 0) return;
+    matters[i] = matters[i].copyWith(active: false, updatedAt: DateTime.now().toIso8601String());
+    repo.saveMatters(matters);
+    notifyListeners();
+  }
+
+  Future<void> deleteMatter(String id) async {
+    matters = matters.where((m) => m.id != id).toList();
+    repo.saveMatters(matters);
+    notifyListeners();
+  }
+
+  /// M-039 目标操作应用。返回 (新目标列表, 日志)。
+  (List<Goal>, List<String>) _applyGoalOps(List<GoalOp> ops) {
+    var list = [...goals];
+    final log = <String>[];
+    final now = DateTime.now().toIso8601String();
+    for (final o in ops) {
+      switch (o.op) {
+        case 'add':
+          final t = (o.title ?? '').trim();
+          if (t.isEmpty) {
+            log.add('丢弃目标新增：标题为空');
+            continue;
+          }
+          final reqs = o.requirements
+              .map((r) => r.trim())
+              .where((r) => r.isNotEmpty)
+              .toList();
+          final g = Goal(
+            id: 'g_${DateTime.now().millisecondsSinceEpoch}_${_goalIdSeq++}', // M-074：防同毫秒碰撞（一轮建多目标时旧写法全撞同一 id）
+            title: t,
+            requirements: reqs, // M-052：建目标时提炼要求清单
+            createdAt: now,
+            updatedAt: now,
+          );
+          list = [...list, g];
+          log.add('新目标「$t」已建立');
+          if (reqs.isNotEmpty) log.add('目标要求 ${reqs.length} 项已记录');
+        case 'update':
+          final i = list.indexWhere((g) => g.id == o.id);
+          if (i < 0) {
+            log.add('丢弃目标修改：找不到 ${o.id}');
+            continue;
+          }
+          final t = (o.title ?? '').trim();
+          list[i] = list[i].copyWith(title: t.isEmpty ? null : t, updatedAt: now);
+          log.add('目标改为「${list[i].title}」');
+        case 'update_requirements': // M-052：改要求清单（全量替换）
+          final i = list.indexWhere((g) => g.id == o.id);
+          if (i < 0) {
+            log.add('丢弃要求更新：目标不存在');
+            continue;
+          }
+          final reqs = o.requirements
+              .map((r) => r.trim())
+              .where((r) => r.isNotEmpty)
+              .toList();
+          list[i] = list[i].copyWith(requirements: reqs, updatedAt: now);
+          log.add('「${list[i].title}」要求清单已更新（${reqs.length} 项）');
+        case 'archive':
+          final i = list.indexWhere((g) => g.id == o.id);
+          if (i < 0) continue;
+          // M-053：goal_type 已删——类型保护随之移除。
+          // 统一哲学（老大 03:20+03:38）：完成不是关键点，AI 不得主动判完成
+          // （提示词 F4 管）；archive 只在用户明确说达成/搁置时发生。
+          if ((o.progress ?? '').contains('AI判断达成')) {
+            continue; // 防线保留：AI 自作主张的完成判定丢弃
+          }
+          list[i] = list[i].copyWith(active: false, updatedAt: now);
+          log.add('目标「${list[i].title}」已归档（达成或搁置）');
+        case 'restore':
+          final i = list.indexWhere((g) => g.id == o.id);
+          if (i < 0) continue;
+          list[i] = list[i].copyWith(active: true, updatedAt: now);
+          log.add('目标「${list[i].title}」重新激活');
+        case 'delete': // M-065：真删（用户明确说删除时）——旗下事项解除挂靠不删
+          final i = list.indexWhere((g) => g.id == o.id);
+          if (i < 0) {
+            log.add('丢弃 delete：目标不存在（id=${o.id}）');
+            continue;
+          }
+          final title = list[i].title;
+          list.removeAt(i);
+          // 旗下事项解挂（事项本身保留，转为未归属）
+          matters = matters
+              .map((m) => m.goalRef == o.id ? (m.copyWith(goalRef: '')) : m)
+              .toList();
+          log.add('目标「$title」已删除（旗下事项转为未归属）');
+        case 'set_progress':
+          final i = list.indexWhere((g) => g.id == o.id);
+          if (i < 0) continue;
+          final p = (o.progress ?? '').trim();
+          if (p.isEmpty) continue;
+          // M-040 累积式进度：新进度 append 进 history（不覆盖旧记录，老大裁决）；
+          // progress 字段仍存最新一条供展示。
+          final today = o.date?.isNotEmpty == true
+              ? o.date!
+              : now.substring(0, 10);
+          final hist = [
+            ...list[i].progressHistory,
+            {'date': today, 'note': p},
+          ];
+          // 防膨胀：终身型目标历史长——保留最近 200 条（约大半年日更量级）
+          final trimmed =
+              hist.length > 200 ? hist.sublist(hist.length - 200) : hist;
+          list[i] = list[i].copyWith(
+              progress: p, progressHistory: trimmed, updatedAt: now);
+          log.add('目标「${list[i].title}」进度记录 +1（$today）');
+        case 'attach_matter':
+          // 把事项挂到目标：改 matters 的 goal_ref（一事项一目标，老大裁决）
+          final gi = list.indexWhere((g) => g.id == o.id);
+          if (gi < 0) {
+            log.add('丢弃挂靠：目标不存在');
+            continue;
+          }
+          var ms = repo.loadMatters();
+          var hit = false;
+          final updated = <Matter>[];
+          for (final m in ms) {
+            if ((o.matterId != null && m.id == o.matterId) ||
+                (o.matterName != null && m.active && m.name == o.matterName)) {
+              hit = true;
+              log.add('「${m.name}」已归入目标「${list[gi].title}」');
+              updated.add(m.copyWith(goalRef: list[gi].id, updatedAt: now));
+            } else {
+              updated.add(m);
+            }
+          }
+          if (hit) repo.saveMatters(updated);
+          if (!hit) log.add('挂靠失败：找不到该事项');
+        default:
+          log.add('丢弃目标操作：未知 op ${o.op}');
+      }
+    }
+    repo.saveGoals(list);
+    return (list, log);
+  }
+
+  // ============ M-050 人工编辑（懂我页，老大 22:00 需求）============
+
+  /// 改说明书条目（section+index 定位）；人工改的条目 origin='user' + evidence 标记
+  Future<void> editPlaybookEntry(String section, int index, String newContent) async {
+    final sections = {
+      'traits': profile.traits, 'patterns': profile.patterns,
+      'recharges': profile.recharges, 'preferences': profile.preferences,
+    };
+    final list = sections[section];
+    if (list == null || index < 0 || index >= list.length) return;
+    final updated = [...list];
+    updated[index] = updated[index].copyWith(
+      content: newContent,
+      origin: 'user',
+      evidence: '老大手工修订',
+      updatedAt: DateTime.now().toIso8601String(),
+    );
+    profile = profile.copyWith(
+      traits: section == 'traits' ? updated.cast<ProfileEntry>() : null,
+      patterns: section == 'patterns' ? updated.cast<ProfileEntry>() : null,
+      recharges: section == 'recharges' ? updated.cast<ProfileEntry>() : null,
+      preferences: section == 'preferences' ? updated.cast<ProfileEntry>() : null,
+    );
+    await profileStore.save(profile);
+    _syncPlaybookFromProfile();
+    notifyListeners();
+  }
+
+  /// 删说明书条目
+  Future<void> deletePlaybookEntry(String section, int index) async {
+    final sections = {
+      'traits': profile.traits, 'patterns': profile.patterns,
+      'recharges': profile.recharges, 'preferences': profile.preferences,
+    };
+    final list = sections[section];
+    if (list == null || index < 0 || index >= list.length) return;
+    final updated = [...list]..removeAt(index);
+    profile = profile.copyWith(
+      traits: section == 'traits' ? updated.cast<ProfileEntry>() : null,
+      patterns: section == 'patterns' ? updated.cast<ProfileEntry>() : null,
+      recharges: section == 'recharges' ? updated.cast<ProfileEntry>() : null,
+      preferences: section == 'preferences' ? updated.cast<ProfileEntry>() : null,
+    );
+    await profileStore.save(profile);
+    _syncPlaybookFromProfile();
+    notifyListeners();
+  }
+
+  /// 改身份段（index 定位；identity/from/to 可空=不改）
+  Future<void> editIdentity(int index, {String? identity, String? from, String? to}) async {
+    final tl = [...profile.identityTimeline];
+    if (index < 0 || index >= tl.length) return;
+    tl[index] = tl[index].copyWith(
+      identity: identity?.trim().isEmpty == true ? null : identity?.trim(),
+      from: from?.trim().isEmpty == true ? null : from?.trim(),
+      to: to?.trim().isEmpty == true ? null : to?.trim(),
+    );
+    profile = profile.copyWith(identityTimeline: tl);
+    await profileStore.save(profile);
+    _syncPlaybookFromProfile();
+    notifyListeners();
+  }
+
+  /// 删身份段
+  Future<void> deleteIdentity(int index) async {
+    final tl = [...profile.identityTimeline];
+    if (index < 0 || index >= tl.length) return;
+    tl.removeAt(index);
+    profile = profile.copyWith(identityTimeline: tl);
+    await profileStore.save(profile);
+    _syncPlaybookFromProfile();
+    notifyListeners();
+  }
+
+  /// 改称呼
+  Future<void> setNickname(String nickname) async {
+    profile = profile.copyWith(nickname: nickname.trim());
+    await profileStore.save(profile);
+    notifyListeners();
+  }
+
+  void _syncPlaybookFromProfile() {
+    playbook = UserPlaybook(
+      traits: profile.traits, patterns: profile.patterns,
+      recharges: profile.recharges, preferences: profile.preferences,
+      lastReviewAt: profile.lastReviewAt,
+    );
+  }
+
+  /// M-038 档案操作：set_nickname / add_identity（新段）/ end_identity（末段补 to）。
+  /// 返回 (新档案, 日志)；非法 op 丢弃记日志。
+  (UserProfile, List<String>) _applyProfileOps(List<ProfileOp> ops) {
+    var p = profile;
+    final log = <String>[];
+    for (final o in ops) {
+      switch (o.op) {
+        case 'set_nickname':
+          final n = (o.nickname ?? '').trim();
+          if (n.isEmpty) {
+            log.add('丢弃 set_nickname：称呼为空');
+            continue;
+          }
+          p = p.copyWith(nickname: n);
+          log.add('称呼已设为「$n」');
+        case 'add_identity':
+          final id = (o.identity ?? '').trim();
+          if (id.isEmpty) {
+            log.add('丢弃 add_identity：身份为空');
+            continue;
+          }
+          // 若末段未结束，先补 to（AI 通常同时发 end_identity；此处兜底）
+          var timeline = [...p.identityTimeline];
+          if (timeline.isNotEmpty && timeline.last.isCurrent && o.to.isNotEmpty) {
+            timeline[timeline.length - 1] = timeline.last.copyWith(to: o.to);
+          }
+          timeline = [...timeline, IdentityPeriod(
+            identity: id, from: o.from, note: o.note)];
+          p = p.copyWith(identityTimeline: timeline);
+          log.add('身份入档：${o.from.isNotEmpty ? '${o.from}起 ' : ''}$id');
+        case 'end_identity':
+          var timeline = [...p.identityTimeline];
+          if (timeline.isEmpty || !timeline.last.isCurrent) {
+            log.add('丢弃 end_identity：无进行中的身份段');
+            continue;
+          }
+          timeline[timeline.length - 1] = timeline.last.copyWith(to: o.to);
+          p = p.copyWith(identityTimeline: timeline);
+          log.add('身份段结束于 ${o.to}');
+        case 'update_identity': // M-045 UI-02：改段（描述/年份/时间）
+          var timeline = [...p.identityTimeline];
+          final i = int.tryParse(o.index) ?? -1;
+          if (i < 0 || i >= timeline.length) {
+            log.add('丢弃 update_identity：序号越界（$i）');
+            continue;
+          }
+          timeline[i] = timeline[i].copyWith(
+            identity: (o.identity ?? '').trim().isEmpty ? null : o.identity!.trim(),
+            from: o.from.isEmpty ? null : o.from,
+            to: o.to.isEmpty ? null : o.to,
+            note: o.note.isEmpty ? null : o.note,
+          );
+          p = p.copyWith(identityTimeline: timeline);
+          log.add('身份段已改为「${timeline[i].identity}」');
+        case 'remove_identity': // M-045 UI-02：删段
+          var timeline = [...p.identityTimeline];
+          final i = int.tryParse(o.index) ?? -1;
+          if (i < 0 || i >= timeline.length) {
+            log.add('丢弃 remove_identity：序号越界（$i）');
+            continue;
+          }
+          log.add('身份段「${timeline[i].identity}」已删除');
+          timeline.removeAt(i);
+          p = p.copyWith(identityTimeline: timeline);
+        default:
+          log.add('丢弃档案操作：未知 op ${o.op}');
+      }
+    }
+    return (p, log);
+  }
+
   /// 设置页调用：调周期（M-036 可调项）
   Future<void> setReviewCycle(int days) async {
     reviewCycleDays = days;
@@ -164,9 +839,29 @@ class AppState extends ChangeNotifier {
         playbook: playbook,
         userProfile: profileWire,
         days: reviewCycleDays * 2, // 状态数据给两倍周期，供交叉验证
+        goals: goals, // M-039：目标进复盘（定期更新进度的主通道）
+        matters: matters,
       );
 
       final log = <String>['📅 10 天复盘完成'];
+      if (rf.goalOps.isNotEmpty) {
+        // M-039：复盘更新目标进度
+        final r = _applyGoalOps(rf.goalOps);
+        goals = r.$1;
+        log.addAll(r.$2);
+      }
+      if (rf.profileOps.isNotEmpty) {
+        // M-038：身份/称呼对话自动维护（老大裁决：不让用户填表）
+        final r = _applyProfileOps(rf.profileOps);
+        profile = r.$1;
+        await profileStore.save(profile);
+        playbook = UserPlaybook(
+          traits: profile.traits, patterns: profile.patterns,
+          recharges: profile.recharges, preferences: profile.preferences,
+          lastReviewAt: profile.lastReviewAt,
+        );
+        log.addAll(r.$2);
+      }
       if (rf.playbookOps.isNotEmpty) {
         // D4 撤销保护：origin=user 条目不可 remove——在验货前过滤
         final protected = <int>[];
@@ -285,6 +980,25 @@ class AppState extends ChangeNotifier {
         .whereType<Map>()
         .map((m) => ScheduleBlock.fromJson(Map<String, dynamic>.from(m)))
         .toList();
+  }
+
+  /// M-047 补录：按日期分桶落盘（历史时段归位到真实那天）
+  void _persistScheduleByDate(Map<String, List<ScheduleBlock>> byDate) {
+    final all = _readScheduleAll();
+    for (final e in byDate.entries) {
+      final old = (all[e.key] as List? ?? [])
+          .whereType<Map>()
+          .map((m) => ScheduleBlock.fromJson(Map<String, dynamic>.from(m)))
+          .toList();
+      all[e.key] = mergeSchedule(old, e.value)
+          .map((b) => b.toJson())
+          .toList();
+    }
+    safeWriteJson(scheduleFile, all);
+    // 若补录含今天，刷新内存
+    if (byDate.containsKey(today())) {
+      schedule = _loadScheduleFor(today());
+    }
   }
 
   void _persistSchedule(List<ScheduleBlock> blocks) {
@@ -434,8 +1148,18 @@ class AppState extends ChangeNotifier {
       return;
     }
 
-    _replaceSession(arrangeMode, [...session, ChatMsg(text, fromUser: true)]);
+    final nowHm =
+        '${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}';
+    _replaceSession(arrangeMode,
+        [...session, ChatMsg(text, fromUser: true, at: nowHm)]);
+    UsageLog.log('CHAT',
+        '发(${arrangeMode ? '安排' : '沟通'}) ${text.length}字: ${text.length > 50 ? '${text.substring(0, 50)}…' : text}');
+    final _sendSw = Stopwatch()..start();
+    // M-065（BUG-02）：发送期间保活——黑屏下系统 Doze 不掐网络（屏黑但连接在）
+    // 测试环境（无平台通道，wakelockCapable=false）跳过
+    if (_wakelockCapable) WakelockPlus.enable();
     sending = true;
+    streamingPreview = ''; // M-046 重置流式预览
     error = null;
     notifyListeners();
 
@@ -452,7 +1176,24 @@ class AppState extends ChangeNotifier {
         recentDialogue: recent,
         userProfile: profileWire, // M-031 画像随报文（nickname+身份信息）
         playbook: playbook, // M-032 底色层随报文（个人说明书）
+        goals: goals, // M-039 目标账本随报文（大局观）
+        onDelta: (d) {
+          // M-046：流式增量 → UI 实时显示（首字即见，不再干等）
+          streamingPreview += d;
+          notifyListeners();
+        },
+        onUsage: (pt, ct) {
+          _lastPromptTokens = pt;
+          _lastCompletionTokens = ct;
+        },
+        onTiming: (connectMs, ttfbMs, totalMs, chunkCount) {
+          // M-066/067：耗时分解落使用日志（chunk 数=吞吐健康度）
+          UsageLog.log('CHAT',
+              '分解 建连${connectMs}ms 首字${ttfbMs}ms 全程${totalMs}ms 块数$chunkCount');
+        },
+        deepThink: text == kMorningBriefUserMessage, // M-073：晨报开深度思考（全天权衡复杂题）
       );
+      streamingPreview = ''; // 完成后清预览（正式气泡已落位）
 
       // 应用增量（App 侧确定性规则）
       final log = <String>[];
@@ -465,6 +1206,25 @@ class AppState extends ChangeNotifier {
         final r = repo.applyStateUpdates(rf.stateUpdates);
         stateDays = r.data as List<StateDay>;
         log.addAll(r.log);
+      }
+      if (rf.goalOps.isNotEmpty) {
+        // M-039 目标操作：add/update/archive/restore/set_progress/attach_matter
+        final r = _applyGoalOps(rf.goalOps);
+        goals = r.$1;
+        matters = repo.loadMatters(); // attach 可能改了事项的 goal_ref
+        log.addAll(r.$2);
+      }
+      if (rf.profileOps.isNotEmpty) {
+        // M-038：身份/称呼对话自动维护（老大裁决：不让用户填表）
+        final r = _applyProfileOps(rf.profileOps);
+        profile = r.$1;
+        await profileStore.save(profile);
+        playbook = UserPlaybook(
+          traits: profile.traits, patterns: profile.patterns,
+          recharges: profile.recharges, preferences: profile.preferences,
+          lastReviewAt: profile.lastReviewAt,
+        );
+        log.addAll(r.$2);
       }
       if (rf.playbookOps.isNotEmpty) {
         // M-032 说明书增量：改底色必须明示（log 进气泡摘要 = 用户可见可纠）
@@ -482,13 +1242,139 @@ class AppState extends ChangeNotifier {
         log.addAll(pbApplied.log);
       }
       if (rf.scheduleBlocks.isNotEmpty) {
-        // M-013 合并语义：非重叠旧块保留，重叠的被新安排替换
-        schedule = mergeSchedule(schedule, rf.scheduleBlocks);
-        _persistSchedule(schedule);
+        // M-013 合并语义 + M-047 补录分桶：
+        // 带 date 的块（补录历史）落到对应日期桶；不带（今天的安排）走原逻辑
+        final todayBlocks = <ScheduleBlock>[];
+        final byDate = <String, List<ScheduleBlock>>{};
+        for (final b in rf.scheduleBlocks) {
+          if (b.date.isEmpty) {
+            todayBlocks.add(b);
+          } else {
+            byDate.putIfAbsent(b.date, () => []).add(b);
+          }
+        }
+        // M-083：修正日程——replace 日期先清空该日，再落新块（治"旧块残留叠加"）
+        if (rf.scheduleReplaceDates.isNotEmpty) {
+          schedule = schedule
+              .where((b) => !rf.scheduleReplaceDates.contains(b.date))
+              .toList();
+          log.add('已清空 ${rf.scheduleReplaceDates.join("、")} 的旧安排，以本次为准');
+        }
+        if (todayBlocks.isNotEmpty) {
+          schedule = mergeSchedule(schedule, todayBlocks);
+          _persistSchedule(schedule);
+        }
+        if (byDate.isNotEmpty) {
+          _persistScheduleByDate(byDate);
+          log.add('已补录 ${byDate.length} 天的历史时段');
+        }
+      }
+
+      // M-076 V1 作业单回执：有操作被拒 → 把失败清单回喂 AI 补救（最多一次）
+      // 设计（老大裁决的"验收模式"）：全绿零成本；有红才回喂；补救轮再失败就如实上报
+      if (!_isRemedyRound) {
+        final failures = log
+            .where((l) => l.contains('丢弃') ||
+                l.contains('越界') ||
+                l.contains('不存在') ||
+                l.contains('失败'))
+            .toList();
+        if (failures.isNotEmpty &&
+            (rf.matterOps.isNotEmpty ||
+                rf.goalOps.isNotEmpty ||
+                rf.playbookOps.isNotEmpty)) {
+          UsageLog.log('CHAT', '回执触发（${failures.length} 条失败）：${failures.join('; ')}');
+          _isRemedyRound = true;
+          try {
+            final remedyMsg = '【系统回执】你上一轮的操作部分被拒绝，失败清单如下：\n'
+                '${failures.map((f) => '· $f').join('\n')}\n'
+                '请根据失败原因修正操作（如改用正确 id、修正 index、换正确的 op），'
+                '只输出补救所需的 ops 和一句简短说明，不要重复已成功的操作。';
+            final rf2 = await client.chat(
+              matters: matters,
+              state: stateDays,
+              userMessage: remedyMsg,
+              arrangeMode: arrangeMode,
+              userProfile: profileWire,
+              playbook: playbook,
+              goals: goals,
+            );
+            // 应用补救 ops
+            if (rf2.matterOps.isNotEmpty) {
+              final r2 = repo.applyMatterOps(rf2.matterOps);
+              matters = r2.data as List<Matter>;
+              log.addAll(r2.log);
+            }
+            if (rf2.goalOps.isNotEmpty) {
+              final (g2, gl2) = applyGoalOpsForTest(rf2.goalOps);
+              goals = g2;
+              log.addAll(gl2);
+              repo.saveGoals(goals);
+            }
+            if (rf2.stateUpdates.isNotEmpty) {
+              final r2s = repo.applyStateUpdates(rf2.stateUpdates);
+              stateDays = r2s.data as List<StateDay>;
+              log.addAll(r2s.log);
+            }
+            log.add('已自动补救：${rf2.reply.isEmpty ? "见操作摘要" : rf2.reply}');
+          } catch (e) {
+            log.add('补救失败，请人工检查：$e');
+          } finally {
+            _isRemedyRound = false;
+          }
+        }
       }
 
       final replyText = rf.reply.trim().isEmpty ? '（模型未给回复文字）' : rf.reply;
-      _appendSession(arrangeMode, ChatMsg(replyText, sideLog: log));
+      // M-064：本轮完成落日志（耗时/token/操作数）
+      UsageLog.log('CHAT',
+          '收 ${_sendSw.elapsedMilliseconds}ms ↑$_lastPromptTokens ↓$_lastCompletionTokens tok | ops:${rf.matterOps.length}m/${rf.goalOps.length}g/${rf.stateUpdates.length}s/${rf.playbookOps.length}p/${rf.scheduleBlocks.length}块 | ${log.isEmpty ? "无库变更" : log.join("; ")}');
+      // M-060：本地确定性睡眠检测（不依赖 AI）——命中则排醒时通知+摘要提示
+      final intent = await detectSleepIntent(text);
+      if (intent != 'none') {
+        UsageLog.log('ALARM', '意图=$intent 铃声$alarmSlot 醒时=$_wakeAt');
+        final hm =
+            '${_wakeAt!.hour.toString().padLeft(2, '0')}:${_wakeAt!.minute.toString().padLeft(2, '0')}';
+        log.add(_wakeWantBrief
+            ? '已记睡眠（铃声$alarmSlot），$hm 响铃并出晨报'
+            : '闹钟已设（铃声$alarmSlot，$hm 响）');
+      }
+
+      // M-078：闹钟兜底——AI 补设（正则漏网的表达）
+      if (rf.alarmOps.isNotEmpty) {
+        for (final ao in rf.alarmOps) {
+          if (ao.minutesFromNow <= 0) continue;
+          // 判重：本地本轮已设（摘要里有"闹钟已设"）则丢弃 AI 的重复补设
+          final alreadySet = log.any((l) => l.contains('闹钟已设') || l.contains('已记睡眠'));
+          if (alreadySet) {
+            UsageLog.log('ALARM', 'AI 兜底补设被丢弃（本地已设）：${ao.userPhrase}');
+            continue;
+          }
+          _wakeAt = DateTime.now().add(Duration(minutes: ao.minutesFromNow));
+          _wakeWantBrief = ao.wantBrief;
+          alarmSlot = ao.slot;
+          _briefSentToday = false;
+          _saveWakeState();
+          await NotifyService.cancelMorningBrief();
+          await NotifyService.scheduleMorningBrief(_wakeAt!);
+          _scheduleExactRing(); // M-080
+          final hm = '${_wakeAt!.hour.toString().padLeft(2, '0')}:${_wakeAt!.minute.toString().padLeft(2, '0')}';
+          log.add(ao.wantBrief
+              ? '已记睡眠（铃声${ao.slot}），$hm 响铃并出晨报'
+              : '闹钟已设（铃声${ao.slot}，$hm 响）');
+          _logAlarm(ao.userPhrase.isNotEmpty ? ao.userPhrase : text); // M-081
+          // 自学习闭环：漏网表达沉淀日志——喂回开发者优化正则
+          UsageLog.log('ALARM',
+              '【正则漏网·AI兜底】说法="${ao.userPhrase}" 分钟=${ao.minutesFromNow} 晨报=${ao.wantBrief}——请把此模式补进本地正则');
+        }
+      }
+
+
+      _appendSession(arrangeMode, ChatMsg(replyText,
+          sideLog: log,
+          promptTokens: _lastPromptTokens, // M-058：本轮用量随气泡落史
+          completionTokens: _lastCompletionTokens,
+          at: nowHm)); // M-062：回复时刻
       // M-037a：后台时结果走系统通知栏（REQ-015；前台不打扰）
       NotifyService.showReply(
         arrangeMode: arrangeMode,
@@ -500,16 +1386,21 @@ class AppState extends ChangeNotifier {
       );
     } on LlmException catch (e) {
       error = e.message;
+      UsageLog.err('CHAT', '模型调用失败 ${_sendSw.elapsedMilliseconds}ms: ${e.message}');
       _appendSession(arrangeMode, ChatMsg('⚠️ 模型调用失败：${e.message}'));
     } on SocketException catch (e) {
       error = e.message;
+      UsageLog.err('CHAT', '网络断 ${_sendSw.elapsedMilliseconds}ms: ${e.message}（黑屏Doze嫌疑）');
       _appendSession(
           arrangeMode, const ChatMsg('⚠️ 网络不通或供应商域名不可达，请检查网络与配置。'));
     } catch (e) {
       error = e.toString();
+      UsageLog.err('CHAT', '未知异常: $e');
       _appendSession(arrangeMode, ChatMsg('⚠️ 出错了：$e'));
     } finally {
+      if (_wakelockCapable) WakelockPlus.disable(); // 回复完成解除保活
       _persistChat(); // 无论成败，聊天历史落盘（M-011；M-024 起两桶齐落）
+      streamingPreview = '';
       sending = false;
       notifyListeners();
     }

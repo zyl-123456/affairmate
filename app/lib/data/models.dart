@@ -54,6 +54,7 @@ class Matter {
   final bool active; // on/off：off=已归档（完成或放弃）
   final CoreAttrs core; // 内核层三属性
   final Map<String, dynamic> ext; // 扩展层开放键值（如 progress）
+  final String goalRef; // 所属目标 id（M-039：一事项一目标；空=未归目标）
   final String createdAt;
   final String updatedAt;
 
@@ -63,6 +64,7 @@ class Matter {
     this.active = true,
     this.core = const CoreAttrs(),
     this.ext = const {},
+    this.goalRef = '',
     required this.createdAt,
     required this.updatedAt,
   });
@@ -75,6 +77,7 @@ class Matter {
             ? CoreAttrs.fromJson(Map<String, dynamic>.from(j['core']))
             : const CoreAttrs(),
         ext: j['ext'] is Map ? Map<String, dynamic>.from(j['ext']) : {},
+        goalRef: (j['goal_ref'] ?? '').toString(),
         createdAt: (j['created_at'] ?? '').toString(),
         updatedAt: (j['updated_at'] ?? '').toString(),
       );
@@ -85,6 +88,7 @@ class Matter {
         'active': active,
         'core': core.toJson(),
         'ext': ext,
+        if (goalRef.isNotEmpty) 'goal_ref': goalRef,
         'created_at': createdAt,
         'updated_at': updatedAt,
       };
@@ -99,6 +103,7 @@ class Matter {
     bool? active,
     CoreAttrs? core,
     Map<String, dynamic>? ext,
+    String? goalRef,
     String? createdAt,
     String? updatedAt,
   }) =>
@@ -108,6 +113,7 @@ class Matter {
         active: active ?? this.active,
         core: core ?? this.core,
         ext: ext ?? this.ext,
+        goalRef: goalRef ?? this.goalRef,
         createdAt: createdAt ?? this.createdAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );
@@ -214,6 +220,167 @@ class StateDay {
         emotion: emotion,
         motivation: motivation,
       );
+}
+
+// ============ 目标管理（M-039 / 老大 02:41 构想）============
+// 目标 = 概括性描述 + 状态 + 旗下事项引用（一事项一目标，老大裁决）+
+//       进度总结（依据旗下事项执行情况动态更新 + 用户反馈更新）。
+
+class Goal {
+  final String id;
+  final String title; // 概括性描述（如"维持好体态和健康"）
+  final bool active; // 进行中 / 已达成或搁置（归档不删，翻牌）
+  final String progress; // 当前阶段的进度总结（最新一条，展示用）
+  final List<Map<String, String>> progressHistory; // M-040 进度累积史（append 不覆盖）
+  // M-052（老大 03:20 哲学：完成不是关键点，要求才是）：目标要求清单——
+  // 每个目标有自己的标准（如"每周跑≥3次""每周俯卧撑≥200个"），多项数组。
+  // 旗下事项是"做什么"，要求是"做到什么标准"——分层不重叠。
+  final List<String> requirements;
+  final String createdAt;
+  final String updatedAt;
+
+  // M-053（老大 03:38 命令）：goal_type 已删——不纠结目标属于哪种类型，
+  // 专注于达到目标的要求、坚持做旗下的事项。旧数据里的 goal_type 字段读取时忽略。
+
+  const Goal({
+    required this.id,
+    required this.title,
+    this.active = true,
+    this.progress = '',
+    this.progressHistory = const [],
+    this.requirements = const [],
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  bool get isCurrent => active;
+
+  factory Goal.fromJson(Map<String, dynamic> j) => Goal(
+        id: (j['id'] ?? '').toString(),
+        title: (j['title'] ?? '').toString(),
+        active: j['active'] != false,
+        progress: (j['progress'] ?? '').toString(),
+        progressHistory: ((j['progress_history'] as List?) ?? [])
+            .whereType<Map>()
+            .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
+            .toList(growable: false),
+        requirements: ((j['requirements'] as List?) ?? [])
+            .map((e) => e.toString())
+            .where((s) => s.trim().isNotEmpty)
+            .toList(growable: false),
+        createdAt: (j['created_at'] ?? '').toString(),
+        updatedAt: (j['updated_at'] ?? '').toString(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'active': active,
+        if (progress.isNotEmpty) 'progress': progress,
+        if (progressHistory.isNotEmpty) 'progress_history': progressHistory,
+        if (requirements.isNotEmpty) 'requirements': requirements,
+        'created_at': createdAt,
+        'updated_at': updatedAt,
+      };
+
+  Goal copyWith({
+    String? id, // M-074：允许重分配 id（存量碰撞数据自愈用）
+    String? title,
+    bool? active,
+    String? progress,
+    List<Map<String, String>>? progressHistory,
+    List<String>? requirements,
+    String? updatedAt,
+  }) =>
+      Goal(
+        id: id ?? this.id,
+        title: title ?? this.title,
+        active: active ?? this.active,
+        progress: progress ?? this.progress,
+        progressHistory: progressHistory ?? this.progressHistory,
+        requirements: requirements ?? this.requirements,
+        createdAt: createdAt,
+        updatedAt: updatedAt ?? this.updatedAt,
+      );
+}
+
+/// 目标操作（大模型 → App，M-039）
+class GoalOp {
+  final String op; // add / update / archive / restore / set_progress / attach_matter
+  final String? id; // 目标 id（add 空）
+  final String? title;
+  final String? progress; // 进度总结（set_progress）
+  final String? date; // 汇报日期 YYYY-MM-DD（set_progress 时 AI 填，M-040）
+  final String? matterId; // attach_matter：挂靠的事项
+  final String? matterName;
+  final List<String> requirements; // M-052：要求清单（add 带 / update_requirements 全量替换）
+
+  const GoalOp({
+    required this.op,
+    this.id,
+    this.title,
+    this.progress,
+    this.date,
+    this.matterId,
+    this.matterName,
+    this.requirements = const [],
+  });
+
+  factory GoalOp.fromJson(Map<String, dynamic> j) => GoalOp(
+        op: (j['op'] ?? '').toString().toLowerCase(),
+        id: j['id']?.toString(),
+        title: j['title']?.toString(),
+        progress: j['progress']?.toString(),
+        date: j['date']?.toString(),
+        matterId: j['matter_id']?.toString(),
+        matterName: j['matter_name']?.toString(),
+        requirements: ((j['requirements'] as List?) ?? [])
+            .map((e) => e.toString())
+            .where((s) => s.trim().isNotEmpty)
+            .toList(growable: false),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'op': op,
+        if (id != null) 'id': id,
+        if (title != null) 'title': title,
+        if (progress != null) 'progress': progress,
+        if (date != null) 'date': date,
+        if (matterId != null) 'matter_id': matterId,
+        if (matterName != null) 'matter_name': matterName,
+        if (requirements.isNotEmpty) 'requirements': requirements,
+      };
+}
+
+/// M-078 闹钟兜底操作：AI 识别出闹钟意图但本地正则未触发时补设。
+/// [minutesFromNow] 距现在的分钟数；[wantBrief] 是否晨报（睡眠类=true 纯闹钟=false）；
+/// [userPhrase] 用户原话（沉淀到使用日志——喂回开发者优化正则，自学习闭环）。
+class AlarmOp {
+  final int minutesFromNow;
+  final bool wantBrief;
+  final String userPhrase;
+  final int slot; // 铃声槽位 1-4（默认 1）
+
+  const AlarmOp({
+    required this.minutesFromNow,
+    this.wantBrief = false,
+    this.userPhrase = '',
+    this.slot = 1,
+  });
+
+  factory AlarmOp.fromJson(Map<String, dynamic> j) => AlarmOp(
+        minutesFromNow: (j['minutes_from_now'] as num?)?.toInt() ?? 0,
+        wantBrief: j['want_brief'] == true,
+        userPhrase: (j['user_phrase'] ?? '').toString(),
+        slot: ((j['slot'] as num?)?.toInt() ?? 1).clamp(1, 4),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'minutes_from_now': minutesFromNow,
+        'want_brief': wantBrief,
+        'user_phrase': userPhrase,
+        'slot': slot,
+      };
 }
 
 // ============ 个人说明书（底色层，REQ-012 / M-032）============
@@ -339,6 +506,7 @@ class MatterOp {
   final Map<String, dynamic> corePatch; // 内核属性补丁
   final Map<String, dynamic> extPatch; // 扩展属性补丁
   final String? note; // 操作附言（如"用户说交了"）
+  final String goalRef; // 目标挂靠（M-059：add/update 时带 goal_ref 直接挂——修"创建后挂不上需二轮"）
 
   const MatterOp({
     required this.op,
@@ -347,6 +515,7 @@ class MatterOp {
     this.corePatch = const {},
     this.extPatch = const {},
     this.note,
+    this.goalRef = '',
   });
 
   factory MatterOp.fromJson(Map<String, dynamic> j) => MatterOp(
@@ -356,6 +525,7 @@ class MatterOp {
         corePatch:
             j['core'] is Map ? Map<String, dynamic>.from(j['core']) : {},
         extPatch: j['ext'] is Map ? Map<String, dynamic>.from(j['ext']) : {},
+        goalRef: (j['goal_ref'] ?? j['goalRef'] ?? '').toString(),
         note: j['note']?.toString(),
       );
 
@@ -428,6 +598,7 @@ class ScheduleBlock {
   final String matterRef; // 事项名称或引用
   final String reason; // 安排理由
   final int track; // 轨道号：0 主轨 / 1,2,3… 伴随轨（M-034）
+  final String date; // YYYY-MM-DD（M-047 补录：空=今天）
 
   const ScheduleBlock({
     required this.start,
@@ -435,6 +606,7 @@ class ScheduleBlock {
     required this.matterRef,
     this.reason = '',
     this.track = 0,
+    this.date = '',
   });
 
   bool get isParallel => track > 0; // 伴随轨块（旧数据无 track 字段 → 0 → 主轨，兼容）
@@ -445,6 +617,7 @@ class ScheduleBlock {
         matterRef: (j['matter_ref'] ?? (j['matterRef'] ?? '')).toString(),
         reason: (j['reason'] ?? '').toString(),
         track: (j['track'] is int) ? j['track'] as int : (int.tryParse((j['track'] ?? '0').toString()) ?? 0),
+        date: (j['date'] ?? '').toString(),
       );
 
   Map<String, dynamic> toJson() => {
@@ -453,6 +626,7 @@ class ScheduleBlock {
         'matter_ref': matterRef,
         'reason': reason,
         if (track > 0) 'track': track, // 主轨不带字段（省空间+旧版兼容）
+        if (date.isNotEmpty) 'date': date, // M-047 补录：非今天的块带日期
       };
 
   /// 起止分钟数（自 00:00 起）；解析失败返回 null
@@ -469,6 +643,48 @@ class ScheduleBlock {
   }
 }
 
+/// 档案操作（大模型 → App，M-038：身份/称呼对话自动维护）
+class ProfileOp {
+  final String op; // set_nickname / add_identity / end_identity /
+  //                 update_identity（改段）/ remove_identity（删段）——M-045 UI-02
+  final String? nickname; // set_nickname
+  final String? identity; // 身份描述
+  final String from; // 起始年月
+  final String to; // 结束年月
+  final String index; // update/remove：目标段序号（字符串数字，从 0 起）
+  final String note; // 附注
+
+  const ProfileOp({
+    required this.op,
+    this.nickname,
+    this.identity,
+    this.from = '',
+    this.to = '',
+    this.index = '',
+    this.note = '',
+  });
+
+  factory ProfileOp.fromJson(Map<String, dynamic> j) => ProfileOp(
+        op: (j['op'] ?? '').toString().toLowerCase(),
+        nickname: j['nickname']?.toString(),
+        identity: j['identity']?.toString(),
+        from: (j['from'] ?? '').toString(),
+        to: (j['to'] ?? '').toString(),
+        index: (j['index'] ?? '').toString(),
+        note: (j['note'] ?? '').toString(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'op': op,
+        if (nickname != null) 'nickname': nickname,
+        if (identity != null) 'identity': identity,
+        if (from.isNotEmpty) 'from': from,
+        if (to.isNotEmpty) 'to': to,
+        if (index.isNotEmpty) 'index': index,
+        if (note.isNotEmpty) 'note': note,
+      };
+}
+
 /// 接收文件（大模型回传的整体结构）
 class ReceiveFile {
   final List<MatterOp> matterOps;
@@ -476,6 +692,10 @@ class ReceiveFile {
   final String reply; // 给用户的文字回复（兜底必展示）
   final List<ScheduleBlock> scheduleBlocks; // 仅安排模式
   final List<PlaybookOp> playbookOps; // 说明书操作（REQ-012，M-032）
+  final List<ProfileOp> profileOps; // 档案操作（M-038：身份/称呼）
+  final List<GoalOp> goalOps; // 目标操作（M-039）
+  final List<AlarmOp> alarmOps; // 闹钟兜底（M-078：正则漏网时 AI 补设）
+  final List<String> scheduleReplaceDates; // 修正日程：先清空这些日期（M-083）
 
   const ReceiveFile({
     this.matterOps = const [],
@@ -483,6 +703,10 @@ class ReceiveFile {
     this.reply = '',
     this.scheduleBlocks = const [],
     this.playbookOps = const [],
+    this.profileOps = const [],
+    this.goalOps = const [],
+    this.alarmOps = const [],
+    this.scheduleReplaceDates = const [],
   });
 
   /// 容错解析：逐键独立，任一键畸形仅丢弃该键（D-002 红线：不崩溃、不写坏两库）
@@ -555,12 +779,35 @@ class ReceiveFile {
       }
     }
 
+    final prOps = <ProfileOp>[];
+    if (root['profile_ops'] is List) {
+      for (final e in root['profile_ops'] as List) {
+        if (e is Map) {
+          try {
+            prOps.add(ProfileOp.fromJson(Map<String, dynamic>.from(e)));
+          } catch (_) {}
+        }
+      }
+    }
+
     return ReceiveFile(
       matterOps: ops,
       stateUpdates: updates,
       reply: (root['reply'] ?? '').toString(),
       scheduleBlocks: blocks,
       playbookOps: pOps,
+      profileOps: prOps,
+      goalOps: ((root['goal_ops'] as List?) ?? [])
+          .whereType<Map>()
+          .map((m) => GoalOp.fromJson(Map<String, dynamic>.from(m)))
+          .toList(),
+      alarmOps: ((root['alarm_ops'] as List?) ?? [])
+          .whereType<Map>()
+          .map((m) => AlarmOp.fromJson(Map<String, dynamic>.from(m)))
+          .toList(),
+      scheduleReplaceDates: ((root['schedule_replace_dates'] as List?) ?? [])
+          .map((e) => e.toString())
+          .toList(),
     );
   }
 }

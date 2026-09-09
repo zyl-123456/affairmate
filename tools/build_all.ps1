@@ -4,19 +4,24 @@
 #       "锟斤拷"路径错误；junction 无效（CMake 解析回真实路径），必须复制源码到
 #       纯 ASCII 路径编译（详见 开发驱动文档/04 坑位速查表 2026-09-04）。
 # 用法：powershell -File tools\build_all.ps1 [-SkipAndroid] [-SkipWindows]
+#      并行开发（多 worktree）时指定独立源码目录与车间，避免多会话抢同一车间：
+#      powershell -File tools\build_all.ps1 -Project D:\000-me-work\wt-xxx -Workshop D:\sw_build-xxx
 # 依赖：Flutter=D:\flutter，JDK=D:\jdk\jdk-17.0.20.1+1，车间=D:\sw_build
 
 param(
     [switch]$SkipAndroid,
-    [switch]$SkipWindows
+    [switch]$SkipWindows,
+    [string]$Project  = "D:\000-me-work\事务伴侣",
+    [string]$Workshop = "D:\sw_build",
+    [string]$Preview  = "",
+    # 只同步源码到车间 + 拉依赖，不编译（供 parallel_dev.ps1 派单预热用）
+    [switch]$SyncOnly
 )
 
 $ErrorActionPreference = "Stop"
 
-$Project   = "D:\000-me-work\事务伴侣"
 $App       = "$Project\app"
-$Workshop  = "D:\sw_build"
-$Preview   = "$Project\预览版-Windows"
+if ([string]::IsNullOrWhiteSpace($Preview)) { $Preview = "$Project\预览版-Windows" }
 $Flutter   = "D:\flutter\bin\flutter.bat"
 $Env:JAVA_HOME = "D:\jdk\jdk-17.0.20.1+1"
 
@@ -35,6 +40,11 @@ if (Test-Path "$Workshop\windows\flutter\ephemeral") {
 }
 foreach ($f in @("pubspec.yaml", "pubspec.lock", "analysis_options.yaml")) {
     Copy-Item "$App\$f" "$Workshop\$f" -Force
+}
+# 关键：Flutter 插件注册用的隐藏文件（.flutter-plugins* / .metadata）必须一并同步，
+#      否则 pub get 异常时插件表为空，编译期报插件找不到（2026-09-04 踩坑）
+foreach ($f in @(".flutter-plugins", ".flutter-plugins-dependencies", ".metadata")) {
+    if (Test-Path "$App\$f") { Copy-Item "$App\$f" "$Workshop\$f" -Force }
 }
 Write-Host "源码同步完成"
 
@@ -56,6 +66,12 @@ if (-not $pubOk) {
         throw "package_config.json 缺失，无法继续编译"
     }
     Write-Host "package_config 完好，继续编译" -ForegroundColor Yellow
+}
+
+if ($SyncOnly) {
+    Step "SyncOnly 模式：源码同步 + 依赖预热完成，跳过编译"
+    Write-Host "车间：$Workshop"
+    exit 0
 }
 
 # ---------- 3. Windows Release ----------

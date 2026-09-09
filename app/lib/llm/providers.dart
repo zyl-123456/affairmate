@@ -3,6 +3,7 @@
 // 偏差登记（04 文档 M-008）：Windows 预览阶段 Key 用本地文件存储（软件私有目录，单用户机器）；
 // Android APK 打包前恢复 flutter_secure_storage（SEC-002 硬口径届时生效）。
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -12,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../data/models.dart';
 import '../data/safe_io.dart';
+import '../data/usage_log.dart';
 import 'prompt.dart';
 
 /// 供应商配置（OpenAI 兼容口径：智谱/Kimi/DeepSeek 等主流国产供应商全兼容）
@@ -79,12 +81,32 @@ class LlmClient {
     List<Map<String, dynamic>> recentDialogue = const [],
     Map<String, dynamic> userProfile = const {},
     UserPlaybook playbook = const UserPlaybook(),
+    List<Goal> goals = const [],
+    void Function(String delta)? onDelta,
+    void Function(int promptTokens, int completionTokens)? onUsage,
+    void Function(int connectMs, int ttfbMs, int totalMs, int chunkCount)? onTiming,
+    bool deepThink = false, // M-073：晨报等重规划场景传 true
   }) async {
     final mattersWire = wireMatters(matters);
     final userPayload = jsonEncode({
       'mode': arrangeMode ? 'arrange' : 'chat',
       if (userProfile.isNotEmpty) 'user_profile': userProfile,
       if (!playbook.isEmpty) 'user_playbook': playbook.toJson(),
+      if (goals.isNotEmpty)
+        'goals_kb': [
+          for (final g in goals)
+            {
+              'id': g.id,
+              'title': g.title,
+              'requirements': g.requirements, // M-052 要求清单（复盘对照检查）
+              'active': g.active,
+              if (g.progress.isNotEmpty) 'progress': g.progress,
+              'matters': [
+                for (final m in matters)
+                  if (m.goalRef == g.id && m.active) m.name
+              ],
+            }
+        ],
       'matters_kb': mattersWire,
       'state_kb': wireState(state),
       if (recentDialogue.isNotEmpty)
@@ -92,9 +114,19 @@ class LlmClient {
       'user_said': userMessage,
     });
 
+    // M-067b：报文大小计量（定位"等待久"是否与 payload 相关）
+    final payloadBytes = utf8.encode(userPayload).length;
+    final sysBytes = utf8.encode(kAgentSystemPrompt).length;
+    UsageLog.log('CHAT',
+        '报文 user=${payloadBytes}B(${(payloadBytes / 1024).toStringAsFixed(1)}KB) sys=${sysBytes}B 合计${((payloadBytes + sysBytes) / 1024).toStringAsFixed(1)}KB');
+
     final raw = await _chatCompletion(
       system: kAgentSystemPrompt,
       user: userPayload,
+      onDelta: onDelta,
+      onUsage: onUsage,
+      onTiming: onTiming,
+      deepThink: deepThink, // M-073 思考分级透传
     );
     return ReceiveFile.parse(raw);
   }
@@ -109,6 +141,8 @@ class LlmClient {
     required UserPlaybook playbook,
     required Map<String, dynamic> userProfile,
     required int days,
+    List<Goal> goals = const [],
+    List<Matter> matters = const [],
   }) async {
     // 近 N 天状态（按日期倒序取）
     final sorted = [...state]..sort((a, b) => b.date.compareTo(a.date));
@@ -119,12 +153,27 @@ class LlmClient {
       'days': days,
       if (userProfile.isNotEmpty) 'user_profile': userProfile,
       if (!playbook.isEmpty) 'user_playbook': playbook.toJson(),
+      if (goals.isNotEmpty)
+        'goals_kb': [
+          for (final g in goals)
+            {
+              'id': g.id, 'title': g.title,
+              'requirements': g.requirements, // M-052
+              'active': g.active,
+              if (g.progress.isNotEmpty) 'progress': g.progress,
+              'matters': [
+                for (final m in matters)
+                  if (m.goalRef == g.id && m.active) m.name
+              ],
+            }
+        ],
       'state_history': kept.map((d) => d.toJson()).toList(),
       'schedule_history': scheduleAll,
     });
 
     final raw = await _chatCompletion(
       system: kReviewSystemPrompt,
+      deepThink: true, // M-073：复盘=数据提炼复杂题，开深度思考
       user: userPayload,
     );
     return ReceiveFile.parse(raw);
@@ -154,29 +203,68 @@ class LlmClient {
   Future<String> _chatCompletion({
     required String system,
     required String user,
+    void Function(String delta)? onDelta,
+    void Function(int promptTokens, int completionTokens)? onUsage,
+    void Function(int connectMs, int ttfbMs, int totalMs, int chunkCount)? onTiming,
+    bool deepThink = false, // M-073：思考策略分级——日常指令关；复盘/晨报开
   }) async {
     final uri = Uri.parse('${config.baseUrl.replaceAll(RegExp(r'/+$'), '')}/chat/completions');
+    final headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ${config.apiKey}',
+    };
+    final payload = jsonEncode({
+      'model': config.model,
+      'messages': [
+        {'role': 'system', 'content': system},
+        {'role': 'user', 'content': user},
+      ],
+      'temperature': 0.3,
+      // M-068/072 输出上限：4096→8192。上一轮 4096 时思考型模型（GLM/DeepSeek
+      // 的 reasoning_content 思考草稿）把额度吃光→正文为空→"响应结构异常"。
+      // 8192 给草稿留空间；正常回复仍受 D2 纪律约束（≤120字）不膨胀。
+      'max_tokens': 8192,
+      // M-072/073 思考策略分级（老大裁决：需要的地方一定开，不必要的关）：
+      // · 日常沟通/安排/连通测试（deepThink=false）：结构化指令+短回复，关思考提速；
+      // · 复盘/晨报（deepThink=true）：数据提炼+全天权衡的真复杂题，开思考保质量。
+      // 智谱口径 thinking.type；DeepSeek 等不识别该键会安全忽略。
+      ...deepThink
+          ? <String, dynamic>{'thinking': {'type': 'enabled'}}
+          : <String, dynamic>{'thinking': {'type': 'disabled'}}, // M-073 分级
+    });
+
+    // M-046 流式输出（老大 14:23 反馈"等太久"）：
+    // 优先 SSE 流式——首字到达即回调 onDelta（UI 可实时显示），总耗时不变但体感大增。
+    // 流式失败（网关不支持等）自动回退非流式。协议：OpenAI 兼容 delta.content。
+    if (onDelta != null) {
+      try {
+        final streamed =
+            await _chatCompletionStream(uri, headers, payload, onDelta, onUsage, onTiming);
+        if (streamed.trim().isNotEmpty) return streamed;
+        // 空结果（测试 Mock / 网关异常）→ 回退非流式
+      } catch (_) {
+        // 流式通道异常（网关不支持 SSE 等）→ 回退非流式
+      }
+    }
+
     // 90s 超时：大模型长回复常见 30~60s；无超时会让 sending 永久卡死（M-020 实测教训）
     final resp = await httpClient.post(
       uri,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ${config.apiKey}',
-      },
-      body: jsonEncode({
-        'model': config.model,
-        'messages': [
-          {'role': 'system', 'content': system},
-          {'role': 'user', 'content': user},
-        ],
-        'temperature': 0.3,
-      }),
+      headers: headers,
+      body: payload,
     ).timeout(const Duration(seconds: 90));
     if (resp.statusCode != 200) {
       throw LlmException(
           'HTTP ${resp.statusCode}: ${_clip(resp.body)}');
     }
     final body = jsonDecode(resp.body);
+    if (body is Map && onUsage != null) {
+      final usage = body['usage'];
+      if (usage is Map) {
+        onUsage((usage['prompt_tokens'] as int?) ?? 0,
+            (usage['completion_tokens'] as int?) ?? 0);
+      }
+    }
     final choices = body is Map ? body['choices'] : null;
     if (choices is List && choices.isNotEmpty) {
       final msg = choices.first is Map ? choices.first['message'] : null;
@@ -186,6 +274,93 @@ class LlmClient {
       }
     }
     throw LlmException('响应结构异常: ${_clip(resp.body)}');
+  }
+
+  /// M-046 SSE 流式：stream:true 逐块收 delta.content，实时回调。
+  /// 返回拼接的完整文本；[DONE] 结束。
+  Future<String> _chatCompletionStream(Uri uri, Map<String, String> headers,
+      String body, void Function(String delta) onDelta,
+      [void Function(int promptTokens, int completionTokens)? onUsage,
+      void Function(int connectMs, int ttfbMs, int totalMs, int chunkCount)? onTiming]) async {
+    final req = http.Request('POST', uri)
+      ..headers.addAll(headers)
+      ..body = jsonEncode({
+        ...jsonDecode(body) as Map<String, dynamic>,
+        'stream': true,
+        // M-062：要求流式响应回传 usage 块（OpenAI 兼容口径；智谱/DeepSeek 支持）
+        'stream_options': {'include_usage': true},
+      });
+    final _sw = Stopwatch()..start();
+    final resp = await httpClient.send(req)
+        .timeout(const Duration(seconds: 150)); // M-082：晨报深思考下建连+首包可超 90s
+    final _connectMs = _sw.elapsedMilliseconds; // M-066：建连耗时
+    var _ttfbMs = 0; // M-066：首字延迟（TTFB）
+
+    if (resp.statusCode != 200) {
+      final errBody = await resp.stream.bytesToString();
+      throw LlmException('HTTP ${resp.statusCode}: ${_clip(errBody)}');
+    }
+
+    final buf = StringBuffer();
+    var lineBuf = '';
+    var _chunkCount = 0; // M-067：chunk 计数（吞吐健康度）
+    try {
+      await for (final chunk in resp.stream
+          .transform(utf8.decoder)
+          .timeout(const Duration(seconds: 25))) { // 25s 无数据=TimeoutException（M-067 看门狗）
+        _chunkCount++;
+        lineBuf += chunk;
+        // SSE 事件按行分隔（data: {...}）；跨块的行缓冲在 lineBuf
+        while (true) {
+          final idx = lineBuf.indexOf('\n');
+          if (idx < 0) break;
+          final line = lineBuf.substring(0, idx).trim();
+          lineBuf = lineBuf.substring(idx + 1);
+          if (!line.startsWith('data:')) continue;
+          final data = line.substring(5).trim();
+          if (data == '[DONE]') {
+            return buf.toString();
+          }
+          try {
+            final obj = jsonDecode(data);
+            if (obj is Map) {
+              // usage 块（流式通常在最后一块）：捕获 token 用量
+              final usage = obj['usage'];
+              if (usage is Map && onUsage != null) {
+                final pt = (usage['prompt_tokens'] is int)
+                    ? usage['prompt_tokens'] as int
+                    : int.tryParse('${usage['prompt_tokens']}') ?? 0;
+                final ct = (usage['completion_tokens'] is int)
+                    ? usage['completion_tokens'] as int
+                    : int.tryParse('${usage['completion_tokens']}') ?? 0;
+                onUsage(pt, ct);
+              }
+              final choices = obj['choices'];
+              if (choices is List && choices.isNotEmpty) {
+                final delta = choices.first is Map ? choices.first['delta'] : null;
+                if (delta is Map) {
+                  final piece = (delta['content'] ?? '').toString();
+                  if (piece.isNotEmpty) {
+                    if (_ttfbMs == 0) _ttfbMs = _sw.elapsedMilliseconds; // M-066
+                    buf.write(piece);
+                    onDelta(piece); // 实时回调（UI 逐字显示）
+                  }
+                }
+              }
+            }
+          } catch (_) {/* 单块坏 JSON 跳过 */}
+        }
+      }
+    } catch (_) {
+      // M-047 BUG-01：连接中途断（DeepSeek 实测 ClientException）
+      // 已收内容够多（>50 字）→ 返回已收文本（半截回复好过整轮报错重发）
+      if (buf.length > 50) return buf.toString();
+      rethrow; // 收得太少：当作流式失败，外层回退非流式
+    }
+    // M-066：耗时分解（建连/首字/全程）——定位"等待过久"到底慢在哪段
+    debugPrint('STREAM-TIMING connect=$_connectMs ttfb=$_ttfbMs total=${_sw.elapsedMilliseconds}');
+    onTiming?.call(_connectMs, _ttfbMs, _sw.elapsedMilliseconds, _chunkCount);
+    return buf.toString(); // 流正常结束但无 [DONE]
   }
 
   /// 错误信息裁剪（防 substring 越界 + 防超长刷屏）

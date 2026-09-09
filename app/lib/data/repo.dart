@@ -12,10 +12,14 @@ class Repo {
   final File mattersFile;
   final File stateFile;
   final File playbookFile; // 个人说明书（底色层，M-032）
+  final File goalsFile; // 目标账本（M-039）
 
-  Repo(this.mattersFile, this.stateFile, [File? playbookFile])
+  Repo(this.mattersFile, this.stateFile,
+      [File? playbookFile, File? goalsFile])
       : playbookFile = playbookFile ??
-            File('${stateFile.parent.path}${Platform.pathSeparator}playbook.json');
+            File('${stateFile.parent.path}${Platform.pathSeparator}playbook.json'),
+        goalsFile = goalsFile ??
+            File('${stateFile.parent.path}${Platform.pathSeparator}goals.json');
 
   /// 工厂：按目录构造（目录自动创建，文件不存在时给空库）
   factory Repo.at(Directory dir) {
@@ -65,6 +69,21 @@ class Repo {
 
   void savePlaybook(UserPlaybook pb) {
     safeWriteJson(playbookFile, pb.toJson());
+  }
+
+  // ============ 目标账本（M-039）============
+
+  List<Goal> loadGoals() {
+    final decoded = readJsonWithFallback(goalsFile);
+    if (decoded is! List) return [];
+    return decoded
+        .whereType<Map>()
+        .map((m) => Goal.fromJson(Map<String, dynamic>.from(m)))
+        .toList();
+  }
+
+  void saveGoals(List<Goal> goals) {
+    safeWriteJson(goalsFile, goals.map((g) => g.toJson()).toList());
   }
 
   /// 应用说明书增量：每板块独立、条目级校验（content 空丢弃；板块名未知丢弃）。
@@ -178,6 +197,7 @@ class Repo {
             active: true,
             core: CoreAttrs.fromJson(o.corePatch),
             ext: Map<String, dynamic>.from(o.extPatch),
+            goalRef: o.goalRef, // M-059：add 直接挂目标（修"创建后挂不上需二轮"）
             createdAt: now,
             updatedAt: now,
           ));
@@ -246,6 +266,7 @@ class Repo {
     return m.copyWith(
       core: core,
       ext: ext,
+      goalRef: o.goalRef.isNotEmpty ? o.goalRef : null, // M-059：update 可改挂靠
       name: (o.name ?? '').trim().isNotEmpty ? o.name!.trim() : m.name,
       updatedAt: now,
     );

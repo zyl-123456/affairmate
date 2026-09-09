@@ -103,7 +103,61 @@ class VoiceInput extends ChangeNotifier {
 
   /// 用当前激活供应商的 Key 调 GLM-ASR。端点跟随供应商配置：
   /// Coding Plan 供应商 → coding 通道；其余 → 常规通道。
+  /// M-045 UI-03：云端限单条 ≤30s——超 25s 自动按 WAV 帧切段逐段转写拼接（用户无感）。
   static Future<String> transcribe(File audio) async {
+    final seg = await _splitWavIfLong(audio, const Duration(seconds: 25));
+    if (seg == null) return _transcribeOnce(audio);
+    // 多段：逐段转写，空格拼接；单段失败不拖垮整体（跳过该段）
+    final parts = <String>[];
+    for (final f in seg) {
+      try {
+        final t = await _transcribeOnce(f);
+        if (t.trim().isNotEmpty) parts.add(t.trim());
+      } catch (_) {/* 单段失败跳过 */}
+      try { if (f != audio && f.existsSync()) f.deleteSync(); } catch (_) {}
+    }
+    return parts.join('');
+  }
+
+  /// WAV 时长超 max → 按字节切段（WAV=PCM 等长帧，字节切=时间切）；
+  /// 返回 null 表示不用切。非 WAV（理论上不会）返回 null 走单次。
+  static Future<List<File>?> _splitWavIfLong(File audio, Duration max) async {
+    try {
+      final bytes = await audio.readAsBytes();
+      if (bytes.length < 100) return null;
+      // WAV 头: RIFF....WAVEfmt (28 字节内含采样率/位深/声道)
+      if (!(bytes.length > 44 &&
+          bytes[0] == 0x52 && bytes[1] == 0x49)) return null; // 非 RIFF
+      final byteRate = bytes[28] |
+          (bytes[29] << 8) |
+          (bytes[30] << 16) |
+          (bytes[31] << 24); // bytes/秒
+      if (byteRate <= 0) return null;
+      final dataLen = bytes.length - 44;
+      final durSec = dataLen / byteRate;
+      if (durSec <= max.inSeconds) return null;
+      // 切：每段 max 秒的 PCM + 原 44 字节头
+      final segBytes = byteRate * max.inSeconds;
+      final header = bytes.sublist(0, 44);
+      final files = <File>[];
+      var pos = 44;
+      var i = 0;
+      while (pos < bytes.length) {
+        final end = (pos + segBytes > bytes.length) ? bytes.length : pos + segBytes;
+        final seg = List<int>.from(header)..addAll(bytes.sublist(pos, end));
+        final f = File('${audio.path}.seg$i');
+        await f.writeAsBytes(seg, flush: true);
+        files.add(f);
+        pos = end;
+        i++;
+      }
+      return files;
+    } catch (_) {
+      return null; // 切割失败走单次（宁可被云端拒也不本地崩）
+    }
+  }
+
+  static Future<String> _transcribeOnce(File audio) async {
     final cfg = await ProviderStore.activeProvider();
     if (cfg == null || cfg.apiKey.isEmpty) {
       throw Exception('尚未配置模型供应商');

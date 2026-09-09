@@ -45,6 +45,7 @@ class BackupManager {
       'schema_version': kSchemaVersion,
       'exported_at': DateTime.now().toIso8601String(),
       'matters': readAsList('matters.json'),
+      'goals': readAsList('goals.json'), // M-039 目标账本随备份迁移
       'state': readAsList('state.json'),
       'schedule': readAsMap('schedule.json'),
       'chat': chatMap,
@@ -95,6 +96,7 @@ class BackupManager {
     }
 
     writeSafe('matters.json', decoded['matters'] ?? []);
+    writeSafe('goals.json', decoded['goals'] ?? []); // M-039
     writeSafe('state.json', decoded['state'] ?? []);
     writeSafe('schedule.json', decoded['schedule'] ?? {});
     writeSafe('chat.json', decoded['chat'] ?? {'chat': [], 'arrange': []});

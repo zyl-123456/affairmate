@@ -6,10 +6,9 @@ import 'package:flutter/material.dart';
 import 'dart:io';
 
 import '../data/backup.dart';
-import '../data/profile.dart' show IdentityPeriod;
-import '../data/profile.dart';
 import '../llm/providers.dart';
-import '../llm/sprite.dart';
+import '../data/usage_log.dart';
+import '../llm/audio_store.dart';
 import '../state.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -29,22 +28,8 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _reload();
-    _nickname = TextEditingController(text: widget.app.profile.nickname);
-    _identityRows = widget.app.profile.identityTimeline
-        .map((p) => (TextEditingController(text: p.identity),
-                     TextEditingController(text: p.from),
-                     TextEditingController(text: p.to)))
-        .toList();
-    _profileRows = widget.app.profile.items.entries
-        .map((e) => (TextEditingController(text: e.key),
-                     TextEditingController(text: e.value)))
-        .toList();
   }
 
-  late final TextEditingController _nickname;
-  bool _spriteOn = false; // M-037b 小精灵开关状态（会话内存态；精灵常驻由系统管）
-  List<(TextEditingController, TextEditingController, TextEditingController)> _identityRows = []; // M-033 身份时间线
-  List<(TextEditingController, TextEditingController)> _profileRows = [];
 
   Future<void> _reload() async {
     final all = await ProviderStore.loadAll();
@@ -64,8 +49,8 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
-          // ============ 用户画像（M-031：AI 怎么称呼你 + 身份信息）============
-          Text('用户画像',
+          // ============ 用户档案（M-038：对话自动维护，老大裁决不让用户填表）============
+          Text('用户档案',
               style: TextStyle(fontSize: 12, color: scheme.primary, fontWeight: FontWeight.w600)),
           Card(
             elevation: 0,
@@ -75,107 +60,36 @@ class _SettingsPageState extends State<SettingsPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  TextField(
-                    controller: _nickname,
-                    decoration: const InputDecoration(
-                        labelText: 'AI 怎么称呼你',
-                        hintText: '如：龙老大',
-                        isDense: true),
-                  ),
-                  const SizedBox(height: 10),
-
-                  // ============ 身份时间线（M-033：身份会变，历史不丢）============
-                  Text('身份经历（时间段保留历史，AI 按当前身份安排）',
-                      style: TextStyle(fontSize: 11, color: scheme.outline)),
-                  const SizedBox(height: 6),
-                  for (final (i, row) in _identityRows.indexed)
+                  Row(children: [
+                    Icon(Icons.smart_toy_outlined, size: 18, color: scheme.primary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        widget.app.profile.nickname.isEmpty
+                            ? '还没有称呼'
+                            : '它叫你「${widget.app.profile.nickname}」',
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                  ]),
+                  for (final p in widget.app.profile.identityTimeline)
                     Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Row(children: [
-                        Expanded(
-                          flex: 4,
-                          child: TextField(
-                              controller: row.$1,
-                              decoration: const InputDecoration(
-                                  hintText: '身份（如 控制工程研究生）', isDense: true)),
-                        ),
-                        const SizedBox(width: 4),
-                        Expanded(
-                          flex: 2,
-                          child: TextField(
-                              controller: row.$2,
-                              decoration: const InputDecoration(
-                                  hintText: '从(2023-09)', isDense: true)),
-                        ),
-                        Expanded(
-                          flex: 2,
-                          child: TextField(
-                              controller: row.$3,
-                              decoration: const InputDecoration(
-                                  hintText: '到(空=至今)', isDense: true)),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.remove_circle_outline, size: 18),
-                          onPressed: () => setState(() => _identityRows.removeAt(i)),
-                        ),
-                      ]),
+                      padding: const EdgeInsets.only(top: 6, left: 24),
+                      child: Text(
+                        '· $p.identity（${p.from.isEmpty ? '?' : p.from} ~ ${p.isCurrent ? '至今' : p.to}）',
+                        style: TextStyle(fontSize: 12, color: p.isCurrent ? null : scheme.outline),
+                      ),
                     ),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: TextButton.icon(
-                      icon: const Icon(Icons.add, size: 16),
-                      label: const Text('加一段身份', style: TextStyle(fontSize: 12)),
-                      onPressed: () => setState(() => _identityRows.add((
-                            TextEditingController(),
-                            TextEditingController(),
-                            TextEditingController()))),
-                    ),
-                  ),
-                  const Divider(height: 4),
-                  const SizedBox(height: 6),
-                  for (final (i, row) in _profileRows.indexed)
+                  if (widget.app.profile.identityTimeline.isEmpty)
                     Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Row(children: [
-                        Expanded(
-                          flex: 2,
-                          child: TextField(
-                              controller: row.$1,
-                              decoration: const InputDecoration(
-                                  hintText: '属性（如 年龄）', isDense: true)),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          flex: 3,
-                          child: TextField(
-                              controller: row.$2,
-                              decoration: const InputDecoration(
-                                  hintText: '值（如 35）', isDense: true)),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.remove_circle_outline, size: 18),
-                          onPressed: () => setState(() => _profileRows.removeAt(i)),
-                        ),
-                      ]),
+                      padding: const EdgeInsets.only(top: 6, left: 24),
+                      child: Text(
+                        '身份经历随对话自动记录',
+                        style: TextStyle(fontSize: 11, color: scheme.outline, height: 1.5),
+                      ),
                     ),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: TextButton.icon(
-                      icon: const Icon(Icons.add, size: 16),
-                      label: const Text('加一项（年龄/职业/身份…）', style: TextStyle(fontSize: 12)),
-                      onPressed: () => setState(() => _profileRows.add((
-                        TextEditingController(), TextEditingController()))),
-                    ),
-                  ),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton(
-                      onPressed: _saveProfile,
-                      child: const Text('保存画像'),
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text('画像会随每轮对话发给 AI——它将用这个称呼叫你，并结合身份信息做安排。',
+                  const SizedBox(height: 6),
+                  Text('档案由 AI 在对话中自动维护（改了会明说）；完整认知见「懂我」页',
                       style: TextStyle(fontSize: 10, color: scheme.outline)),
                 ],
               ),
@@ -252,36 +166,6 @@ class _SettingsPageState extends State<SettingsPage> {
             onTap: () => _openEditor(),
           ),
 
-          // ============ 桌面小精灵（M-037b，安卓专属）============
-          if (Theme.of(context).platform == TargetPlatform.android) ...[
-            const Divider(),
-            Text('桌面小精灵',
-                style: TextStyle(fontSize: 12, color: scheme.primary, fontWeight: FontWeight.w600)),
-            SwitchListTile(
-              dense: true,
-              secondary: const Icon(Icons.auto_awesome_outlined, size: 20),
-              title: const Text('在桌面显示小精灵（免开 App 随时说）', style: TextStyle(fontSize: 14)),
-              subtitle: const Text('点它选沟通/安排，说话后结果弹通知栏；需要悬浮窗权限',
-                  style: TextStyle(fontSize: 11)),
-              value: _spriteOn,
-              onChanged: (v) async {
-                bool ok;
-                if (v) {
-                  ok = await SpriteController.enable();
-                } else {
-                  await SpriteController.disable();
-                  ok = true;
-                }
-                if (!mounted) return;
-                setState(() => _spriteOn = ok && v);
-                if (v && !ok) {
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                      content: Text('⚠️ 未授予悬浮窗权限（设置→应用→显示在其他应用上层）')));
-                }
-              },
-            ),
-          ],
-
           // ============ 复盘设置（M-036：周期可调，老大 2026-09-06 裁决）============
           const Divider(),
           Text('AI 复盘',
@@ -316,6 +200,134 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
 
+          // ============ 闹钟铃声（M-061：槽位导入，睡醒闹钟用）============
+          Text('闹钟铃声',
+              style: TextStyle(fontSize: 12, color: scheme.primary, fontWeight: FontWeight.w600)),
+          Card(
+            elevation: 0,
+            color: scheme.surfaceContainerLow,
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Column(
+                children: [
+                  FutureBuilder<List<int>>(
+                    future: AudioStore.usedSlots(),
+                    builder: (context, snap) {
+                      final used = snap.data ?? [];
+                      return Column(
+                        children: [
+                          for (var s = 1; s <= AudioStore.maxSlots; s++)
+                            ListTile(
+                              dense: true,
+                              leading: Icon(
+                                used.contains(s) ? Icons.music_note : Icons.music_off_outlined,
+                                size: 20,
+                                color: used.contains(s) ? scheme.primary : scheme.outline,
+                              ),
+                              title: Text('铃声$s' + (used.contains(s) ? ' · 已配置' : ' · 空'),
+                                  style: const TextStyle(fontSize: 13)),
+                              subtitle: used.contains(s)
+                                  ? const Text('睡醒闹钟可用', style: TextStyle(fontSize: 10.5))
+                                  : const Text('点右侧导入音频', style: TextStyle(fontSize: 10.5)),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  TextButton(
+                                    onPressed: () async {
+                                      final ok = await AudioStore.importToSlot(s);
+                                      if (context.mounted) {
+                                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                            content: Text(ok ? '铃声$s 已导入' : '未选择音频或格式不支持')));
+                                      }
+                                      setState(() {});
+                                    },
+                                    child: const Text('导入', style: TextStyle(fontSize: 12)),
+                                  ),
+                                  if (used.contains(s))
+                                    TextButton(
+                                      onPressed: () async {
+                                        await AudioStore.clearSlot(s);
+                                        setState(() {});
+                                      },
+                                      child: const Text('清除',
+                                          style: TextStyle(fontSize: 12, color: Colors.redAccent)),
+                                    ),
+                                ],
+                              ),
+                            ),
+                        ],
+                      );
+                    },
+                  ),
+                  Text('从手机选音频文件导入（mp3/wav/ogg）；铃声1 是睡醒闹钟默认。到点响一遍+震动+亮屏。',
+                      style: TextStyle(fontSize: 10, color: scheme.outline)),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // ============ 使用日志（M-064：出问题时导出发给开发者）============
+          Card(
+            elevation: 0,
+            color: scheme.surfaceContainerLow,
+            child: ListTile(
+              leading: Icon(Icons.receipt_long_outlined, size: 20, color: scheme.primary),
+              title: const Text('使用日志', style: TextStyle(fontSize: 14)),
+              subtitle: const Text('记录使用过程，出问题时导出发我排查', style: TextStyle(fontSize: 11)),
+              trailing: const Icon(Icons.ios_share_outlined, size: 18),
+              onTap: () async {
+                // UI-10：日期筛选（选某天看某天；不选=全部）
+                final dates = await UsageLog.availableDates();
+                String? picked;
+                if (dates.isNotEmpty && context.mounted) {
+                  picked = await showModalBottomSheet<String>(
+                    context: context,
+                    builder: (ctx) => SafeArea(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ListTile(
+                            title: const Text('全部日志'),
+                            onTap: () => Navigator.pop(ctx, '__ALL__'),
+                          ),
+                          for (final d in dates.reversed)
+                            ListTile(
+                              leading: const Icon(Icons.calendar_today_outlined, size: 16),
+                              title: Text(d, style: const TextStyle(fontSize: 13)),
+                              onTap: () => Navigator.pop(ctx, d),
+                            ),
+                        ],
+                      ),
+                    ),
+                  );
+                  if (picked == null) return;
+                }
+                final text = await UsageLog.exportByDate(
+                    (picked == null || picked == '__ALL__') ? null : picked);
+                if (!context.mounted) return;
+                // 简单可靠：弹全屏对话框展示+可长按复制（分享依赖系统面板复杂化，先够用）
+                showDialog(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: const Text('使用日志（长按可复制全文）', style: TextStyle(fontSize: 15)),
+                    content: SizedBox(
+                      width: double.maxFinite,
+                      child: SelectableText(
+                        text.length > 8000 ? '…${text.substring(text.length - 8000)}' : text,
+                        style: const TextStyle(fontSize: 10.5, height: 1.5),
+                      ),
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('关闭')),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+
           // ============ 数据备份/迁移（M-027 老大需求：换机一键迁移）============
           const Divider(),
           Text('数据备份与迁移',
@@ -341,32 +353,6 @@ class _SettingsPageState extends State<SettingsPage> {
         ],
       ),
     );
-  }
-
-  Future<void> _saveProfile() async {
-    final items = <String, String>{};
-    for (final (k, v) in _profileRows) {
-      final key = k.text.trim();
-      if (key.isNotEmpty) items[key] = v.text.trim();
-    }
-    // M-033：身份时间线（身份为空的行丢弃；保持顺序）
-    final timeline = <IdentityPeriod>[];
-    for (final (idc, fc, tc) in _identityRows) {
-      final identity = idc.text.trim();
-      if (identity.isEmpty) continue;
-      timeline.add(IdentityPeriod(
-          identity: identity, from: fc.text.trim(), to: tc.text.trim()));
-    }
-    final old = widget.app.profile;
-    await widget.app.saveProfile(old.copyWith(
-      nickname: _nickname.text.trim(),
-      items: items,
-      identityTimeline: timeline,
-    ));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('✅ 档案已保存，下一轮对话生效')));
-    }
   }
 
   Future<void> _exportBackup() async {
