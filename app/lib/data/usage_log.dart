@@ -105,6 +105,22 @@ class UsageLog {
     return dates;
   }
 
+  /// M-087：导出为文件（写到下载/文档目录，返回路径——分享面板用）
+  static Future<String?> exportToFile([String? datePrefix]) async {
+    try {
+      final text = await exportByDate(datePrefix);
+      final doc = await getApplicationDocumentsDirectory();
+      final d = DateTime.now();
+      final name = 'affairmate_log${datePrefix != null ? "_$datePrefix" : ""}_${d.month}${d.day}_${d.hour}${d.minute}.txt';
+      final f = File('${doc.path}${Platform.pathSeparator}exports${Platform.pathSeparator}$name');
+      await f.create(recursive: true);
+      await f.writeAsString(text);
+      return f.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 导出：返回日志全文（设置页分享用）
   static Future<String> export() async {
     await flush();

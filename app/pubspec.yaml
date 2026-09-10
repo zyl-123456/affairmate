@@ -38,6 +38,7 @@ dependencies:
   audioplayers: 6.1.0
   vibration: 2.0.0
   wakelock_plus: 1.2.8
+  share_plus: 10.0.2
   http: ^1.2.2
   record: 5.1.2
   file_picker: 8.1.2

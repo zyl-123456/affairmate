@@ -90,6 +90,28 @@ class NotifyService {
   }
 
   /// 取消晨报定时（改睡眠时间时先撤旧的）
+  /// M-093：通知权限检查（第三防线——App 被杀时系统通知是唯一兜底）
+  static Future<bool> notificationsEnabled() async {
+    try {
+      return await _plugin.resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
+          ?.requestNotificationsPermission() ??
+          true; // 非 Android 平台视为已开
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// M-093：请求通知权限（弹系统对话框）
+  static Future<void> requestNotifyPermission() async {
+    try {
+      await _plugin
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
+          ?.requestNotificationsPermission();
+    } catch (_) {}
+  }
+
   static Future<void> cancelMorningBrief() async {
     try {
       await _plugin.cancel(3);

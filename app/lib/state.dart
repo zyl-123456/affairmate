@@ -14,6 +14,10 @@ import '../data/models.dart';
 import '../data/profile.dart';
 import '../data/repo.dart';
 import '../data/safe_io.dart';
+import '../data/daily_snapshot.dart';
+import '../data/day_plan_archive.dart';
+import '../platform/power_service.dart';
+import '../data/wire_log.dart';
 import '../data/usage_log.dart';
 import '../llm/alarm_player.dart';
 import '../llm/audio_store.dart';
@@ -126,6 +130,8 @@ class AppState extends ChangeNotifier {
   String? error;
   String streamingPreview = ''; // M-046 流式预览
   int _lastPromptTokens = 0; // M-058：本轮输入 token
+  int _lastPayloadBytes = 0; // M-087：最近一轮报文体积（快照记录用）
+  bool _snapshotChecked = false; // M-087：今日快照是否已检查过
   int _lastCompletionTokens = 0; // M-058：本轮输出 token
   // M-060 晨报：醒来时刻（App 内持久化小文件）+ 今日晨报是否已发
   DateTime? _wakeAt;
@@ -208,6 +214,7 @@ class AppState extends ChangeNotifier {
     stateDays = repo.loadState();
     goals = repo.loadGoals(); // M-039
     _loadWakeState(); // M-060
+    _loadSettleMark(); // M-096b：日终结算标记
     _loadAlarmHistory(); // M-081
     _dedupeGoalIds(); // M-074：存量同 id 目标重分配（历史碰撞数据自愈）
     schedule = _loadScheduleFor(today());
@@ -294,6 +301,19 @@ class AppState extends ChangeNotifier {
           _wakeAt = DateTime.tryParse((j['wake_at'] ?? '').toString());
           final lastBrief = (j['brief_date'] ?? '').toString();
           _briefSentToday = lastBrief == today();
+          _wakeWantBrief = j['want_brief'] == true; // M-092：恢复真实意图（旧文件无此键=false，纯闹钟安全默认）
+          // M-092b：已过期的残留闹钟——清系统通知（安卓会补发错过的 exact alarm，
+          // 这就是"没设却响了"的来源），再决定是否排新 Timer
+          if (_wakeAt != null && DateTime.now().isAfter(_wakeAt!)) {
+            NotifyService.cancelMorningBrief();
+            if (DateTime.now().difference(_wakeAt!) <= const Duration(hours: 2) && _wakeWantBrief) {
+              // 2h 内且要晨报：保留，由轮询补发
+            } else {
+              _wakeAt = null; // 纯闹钟过期 = 作废（响过没响都翻篇，别诈尸）
+              _saveWakeState();
+              PowerService.stopAlarmGuard(); // M-094
+            }
+          }
           _scheduleExactRing(); // M-080：重启后恢复秒级直达
         }
       }
@@ -305,6 +325,7 @@ class AppState extends ChangeNotifier {
       File(_wakeAtFile).writeAsStringSync(jsonEncode({
         'wake_at': _wakeAt?.toIso8601String() ?? '',
         'brief_date': _briefSentToday ? today() : '',
+        'want_brief': _wakeWantBrief, // M-092：持久化——否则重启后被默认 true 复活（幽灵晨报根因）
       }));
     } catch (_) {}
   }
@@ -394,11 +415,61 @@ class AppState extends ChangeNotifier {
     _saveWakeState();
     await NotifyService.cancelMorningBrief();
     await NotifyService.scheduleMorningBrief(wake);
+    // M-093：设闹钟瞬间确保通知权限在线（第三防线——揣兜被杀时系统通知是唯一响铃通道）
+    final nOk = await NotifyService.notificationsEnabled();
+    if (!nOk) await NotifyService.requestNotifyPermission();
     _scheduleExactRing(); // M-080：秒级直达
     _logAlarm(text); // M-081：入历史
+    // M-094：前台服务守护——黑屏/揣兜期间系统不杀进程（亮屏等就响、黑屏等就哑的终结者）
+    final hm0 = '${wake.hour.toString().padLeft(2, '0')}:${wake.minute.toString().padLeft(2, '0')}';
+    await PowerService.startAlarmGuard('闹钟已设 · $hm0 响');
     return _wakeWantBrief ? 'sleepBrief' : 'alarmOnly';
   }
   // M-066 意图判定结束
+
+  /// M-096b：日终结算触发——跨过 0 点后首次检查时结算昨天（补漏：次日任何时刻启动都会补）
+  Future<void> maybeDayEndSettle() async {
+    final now = DateTime.now();
+    final y = DateTime(now.year, now.month, now.day - 1);
+    final yesterday = '${y.year}-${y.month.toString().padLeft(2, '0')}-${y.day.toString().padLeft(2, '0')}';
+    if (_lastSettledDate == null || _lastSettledDate!.compareTo(yesterday) < 0) {
+      await settleDayInvestment(yesterday);
+    }
+  }
+
+  /// M-087：每日数据快照——每天 08:00 后首次检查时拍（错过时段补拍）。
+  /// 数据是软件优化的底座（老大 01:59 数据观）：快照序列 = 增长的可视化证据。
+  Future<void> maybeDailySnapshot() async {
+    if (_snapshotChecked) return;
+    _snapshotChecked = true;
+    final now = DateTime.now();
+    if (now.hour < 8) {
+      _snapshotChecked = false; // 还没到 08:00，下小时再查
+      return;
+    }
+    final date = today();
+    if (await DailySnapshot.hasToday(date)) return;
+    try {
+      await DailySnapshot.capture(
+        date: date,
+        matters: matters.map((m) => m.toJson()).toList(),
+        goals: goals.map((g) => g.toJson()).toList(),
+        stateDays: stateDays.map((s) => s.toJson()).toList(),
+        chatChat: _todayMessages(chatChat),
+        chatArrange: _todayMessages(chatArrange),
+        playbook: playbook.toJson(),
+        profile: profileWire.isNotEmpty ? profileWire : null,
+        lastPayloadBytes: _lastPayloadBytes,
+      );
+      UsageLog.log('APP', '每日数据快照已保存（$date）');
+    } catch (_) {}
+  }
+
+  List<Map<String, dynamic>> _todayMessages(List<ChatMsg> msgs) {
+    // 会话本体已截尾 200 条/桶；快照再保险截 400——体积永远可控
+    final all = msgs.map((m) => m.toJson()).toList();
+    return all.length > 400 ? all.sublist(all.length - 400) : all;
+  }
 
   /// M-080：排秒级直达闹钟——到点直接响铃（不等 10 秒轮询，更不等被冻结的周期器）
   void _scheduleExactRing() {
@@ -407,7 +478,7 @@ class AppState extends ChangeNotifier {
     final delay = _wakeAt!.difference(DateTime.now());
     if (delay.isNegative || delay.inSeconds > 24 * 3600) return; // 已过/超远不排
     _alarmTimer = Timer(delay, () {
-      if (morningBriefDue) runMorningBrief();
+      runMorningBrief(); // M-095：到点直接触发（内部自判 ringDue——纯闹钟也响）
     });
   }
 
@@ -427,10 +498,19 @@ class AppState extends ChangeNotifier {
 
   /// 到点执行：响铃（播放器循环响）+ 按意图决定是否晨报
   Future<void> runMorningBrief() async {
-    if (!morningBriefDue) return;
+    // M-095：铃声与晨报解耦——到点+未触发过就必响铃（纯闹钟也想响！）
+    // 旧 bug：这里查 morningBriefDue（含 !wantBrief）→ 纯闹钟第一行就被
+    // return 挡死，铃声代码永远到不了——"守护条在+记录在+不响"的真凶。
+    final now = DateTime.now();
+    final ringDue = _wakeAt != null &&
+        now.isAfter(_wakeAt!) &&
+        !_briefSentToday &&
+        now.difference(_wakeAt!) <= const Duration(hours: 2);
+    if (!ringDue) return;
     _briefSentToday = true; // 先标记防重入
     _saveWakeState();
     markAlarmDone(); // M-081：到点触发 → 历史打勾
+    PowerService.stopAlarmGuard(); // M-094：响过了，撤守护
     // M-063：播放器直接响（循环直到停）+ 全屏通知（视觉）
     String? s;
     try {
@@ -450,6 +530,156 @@ class AppState extends ChangeNotifier {
       UsageLog.err('ALARM', '晨报生成失败（回滚待重试）：$e');
       notifyListeners();
     }
+  }
+
+  /// M-096：人工编辑事项全属性（老大要求：AI 之外人也要能改）
+  Future<void> manualEditMatter(String id,
+      {String? name, Map<String, String>? core, Map<String, dynamic>? ext}) async {
+    final i = matters.indexWhere((m) => m.id == id);
+    if (i < 0) return;
+    final j = matters[i].toJson();
+    if (name != null && name.trim().isNotEmpty) j['name'] = name.trim();
+    if (core != null) {
+      final c = (j['core'] as Map?) ?? {};
+      for (final e in core.entries) {
+        if (e.value.trim().isNotEmpty) c[e.key] = e.value.trim();
+      }
+      j['core'] = c;
+    }
+    if (ext != null) {
+      final x = (j['ext'] as Map?) ?? {};
+      for (final e in ext.entries) {
+        if (e.value.toString().trim().isNotEmpty) x[e.key] = e.value;
+      }
+      j['ext'] = x;
+    }
+    matters[i] = Matter.fromJson(Map<String, dynamic>.from(j));
+    repo.saveMatters(matters);
+    notifyListeners();
+  }
+
+  /// M-096：人工写入状态（manual 标记与 AI 推断区分）
+  Future<void> manualWriteState(String dimKey, String value, String evidence) async {
+    final d = today();
+    final idx = stateDays.indexWhere((s) => s.date == d);
+    final j = idx >= 0 ? stateDays[idx].toJson() : {'date': d};
+    final dims = (j['dims'] as Map?) ?? {};
+    dims[dimKey] = {
+      'value': value,
+      'evidence': evidence.isNotEmpty ? evidence : '人工写入',
+      'manual': true,
+    };
+    j['dims'] = dims;
+    final updated = StateDay.fromJson(Map<String, dynamic>.from(j));
+    if (idx >= 0) {
+      stateDays[idx] = updated;
+    } else {
+      stateDays.insert(0, updated);
+    }
+    repo.saveState(stateDays);
+    notifyListeners();
+  }
+
+  /// M-089：给时间块回评（照做/改时做了/没做）——安排效果数据闭环
+  Future<void> reviewBlock(String date, String start, String matterRef, String review) async {
+    final all = _loadScheduleFor(date);
+    var changed = false;
+    final updated = all.map((b) {
+      if (b.date == date && b.start == start && b.matterRef == matterRef && b.review != review) {
+        changed = true;
+        return b.copyWith(review: review);
+      }
+      return b;
+    }).toList();
+    if (changed) {
+      if (date == today()) {
+        schedule = updated;
+        _persistSchedule(updated);
+      } else {
+        _persistScheduleByDate({date: updated});
+      }
+      notifyListeners();
+    }
+  }
+
+  /// M-096b：日终结算——把某天时间条上的最终块形态记入各事项投入履历。
+  /// 幂等：同一天重复结算以最终形态覆盖（结算标记防跨天重算）。
+  String? _lastSettledDate; // 已结算到哪天（内存+盘存）
+  Future<void> settleDayInvestment(String date) async {
+    try {
+      if (_lastSettledDate != null && date.compareTo(_lastSettledDate!) <= 0) return;
+      final blocks = _loadScheduleFor(date);
+      // 按事项名聚合当日总时长
+      final byMatter = <String, double>{};
+      for (final b in blocks) {
+        final d = b.date.isNotEmpty ? b.date : date;
+        if (d != date) continue;
+        final s = _hhmmToMin(b.start), e = _hhmmToMin(b.end);
+        if (s == null || e == null || e <= s) continue;
+        byMatter[b.matterRef] = (byMatter[b.matterRef] ?? 0) + (e - s) / 60.0;
+      }
+      var changed = false;
+      matters = matters.map((m) {
+        final hrs = byMatter[m.name];
+        final log = [...m.investLog.where((l) => l['date'] != date)]; // 先剔除当日旧记录
+        if (hrs != null && hrs > 0) {
+          log.add({'date': date, 'hours': ((hrs * 10).round() / 10).toString(), 'note': '日终结算'});
+          changed = true;
+        } else if (log.length != m.investLog.length) {
+          changed = true; // 当日块被清空的修正
+        }
+        return changed && log.length != m.investLog.length ? _matterWithInvest(m, log) : m;
+      }).toList();
+      if (changed) repo.saveMatters(matters);
+      _lastSettledDate = date;
+      _saveSettleMark(date);
+      // M-097：安排史存档 finalize——最终形态+当日回评计数（晨报学习闭环的原料）
+      final finalJson = blocks.map((b) => b.toJson()).toList();
+      var doneN = 0, movedN = 0, skippedN = 0;
+      for (final b in blocks) {
+        if (b.review == 'done') doneN++;
+        if (b.review == 'moved') movedN++;
+        if (b.review == 'skipped') skippedN++;
+      }
+      await DayPlanArchive.finalize(date, finalJson,
+          doneCount: doneN, movedCount: movedN, skippedCount: skippedN);
+      if (date == today()) {
+        UsageLog.log('APP', '当日投入已结算（$date，${byMatter.length} 个事项）');
+      }
+    } catch (_) {}
+  }
+
+  File get _settleMarkFile =>
+      File('${repo.mattersFile.parent.path}${Platform.pathSeparator}invest_settle_mark.json');
+
+  void _saveSettleMark(String date) {
+    try {
+      _settleMarkFile.writeAsStringSync('{"last_settled": "$date"}');
+    } catch (_) {}
+  }
+
+  void _loadSettleMark() {
+    try {
+      if (_settleMarkFile.existsSync()) {
+        final j = jsonDecode(_settleMarkFile.readAsStringSync());
+        if (j is Map) _lastSettledDate = (j['last_settled'] ?? '').toString();
+      }
+    } catch (_) {}
+  }
+
+  static Matter _matterWithInvest(Matter m, List<Map<String, String>> log) {
+    // Matter 无 copyWith 全参——经 json 往返最稳
+    final j = m.toJson();
+    j['invest_log'] = log;
+    return Matter.fromJson(j);
+  }
+
+  static int? _hhmmToMin(String hhmm) {
+    final m = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(hhmm);
+    if (m == null) return null;
+    final h = int.tryParse(m.group(1)!), mm = int.tryParse(m.group(2)!);
+    if (h == null || mm == null) return null;
+    return h * 60 + mm;
   }
 
   // ============ M-065 目标人工管理（长按菜单）============
@@ -1192,6 +1422,18 @@ class AppState extends ChangeNotifier {
               '分解 建连${connectMs}ms 首字${ttfbMs}ms 全程${totalMs}ms 块数$chunkCount');
         },
         deepThink: text == kMorningBriefUserMessage, // M-073：晨报开深度思考（全天权衡复杂题）
+        onWire: (payload, raw) {
+          // M-088：轮级线上实录——完整包裹+原始作业落盘（归因分析的原料）
+          WireLog.logTurn(
+            arrangeMode: arrangeMode,
+            userSaid: text,
+            payload: payload,
+            rawResponse: raw,
+            promptTokens: _lastPromptTokens,
+            completionTokens: _lastCompletionTokens,
+            elapsedMs: _sendSw.elapsedMilliseconds,
+          );
+        },
       );
       streamingPreview = ''; // 完成后清预览（正式气泡已落位）
 
@@ -1261,8 +1503,17 @@ class AppState extends ChangeNotifier {
           log.add('已清空 ${rf.scheduleReplaceDates.join("、")} 的旧安排，以本次为准');
         }
         if (todayBlocks.isNotEmpty) {
+          // M-097：当天首次落块=晨报初稿存档；后续=修改追记（学习闭环原料）
+          final date0 = today();
+          final json0 = todayBlocks.map((b) => b.toJson()).toList();
+          await DayPlanArchive.saveDraft(date0, json0);
+          await DayPlanArchive.addRevision(date0, {
+            'at': DateTime.now().toIso8601String(),
+            'blocks': json0.map((b) => "\${b['start']}~\${b['end']} \${b['matter_ref']}").join('; '),
+          });
           schedule = mergeSchedule(schedule, todayBlocks);
           _persistSchedule(schedule);
+          // M-096b：不再落块即累计（晨报草案≠最终执行）——当日 24 点日终结算
         }
         if (byDate.isNotEmpty) {
           _persistScheduleByDate(byDate);

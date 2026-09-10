@@ -86,6 +86,7 @@ class LlmClient {
     void Function(int promptTokens, int completionTokens)? onUsage,
     void Function(int connectMs, int ttfbMs, int totalMs, int chunkCount)? onTiming,
     bool deepThink = false, // M-073：晨报等重规划场景传 true
+    void Function(String payload, String rawResponse)? onWire, // M-088：线上实录（快照用）
   }) async {
     final mattersWire = wireMatters(matters);
     final userPayload = jsonEncode({
@@ -128,6 +129,7 @@ class LlmClient {
       onTiming: onTiming,
       deepThink: deepThink, // M-073 思考分级透传
     );
+    onWire?.call(userPayload, raw); // M-088：完整请求+原始响应实录
     return ReceiveFile.parse(raw);
   }
 
@@ -239,7 +241,8 @@ class LlmClient {
     if (onDelta != null) {
       try {
         final streamed =
-            await _chatCompletionStream(uri, headers, payload, onDelta, onUsage, onTiming);
+            await _chatCompletionStream(
+                uri, headers, payload, onDelta, onUsage, onTiming, deepThink);
         if (streamed.trim().isNotEmpty) return streamed;
         // 空结果（测试 Mock / 网关异常）→ 回退非流式
       } catch (_) {
@@ -247,12 +250,13 @@ class LlmClient {
       }
     }
 
-    // 90s 超时：大模型长回复常见 30~60s；无超时会让 sending 永久卡死（M-020 实测教训）
+    // M-090：90→240s。破案链（09-10 11:44 晨报超时）：深思考首字>25s → 25s 看门狗
+    // 杀流式 → 回退本非流式路径 → 深思考总时长又超 90s → 全灭。240s=晨报深思考兜底。
     final resp = await httpClient.post(
       uri,
       headers: headers,
       body: payload,
-    ).timeout(const Duration(seconds: 90));
+    ).timeout(const Duration(seconds: 240));
     if (resp.statusCode != 200) {
       throw LlmException(
           'HTTP ${resp.statusCode}: ${_clip(resp.body)}');
@@ -281,7 +285,8 @@ class LlmClient {
   Future<String> _chatCompletionStream(Uri uri, Map<String, String> headers,
       String body, void Function(String delta) onDelta,
       [void Function(int promptTokens, int completionTokens)? onUsage,
-      void Function(int connectMs, int ttfbMs, int totalMs, int chunkCount)? onTiming]) async {
+      void Function(int connectMs, int ttfbMs, int totalMs, int chunkCount)? onTiming,
+      bool deepThink = false]) async {
     final req = http.Request('POST', uri)
       ..headers.addAll(headers)
       ..body = jsonEncode({
@@ -307,7 +312,7 @@ class LlmClient {
     try {
       await for (final chunk in resp.stream
           .transform(utf8.decoder)
-          .timeout(const Duration(seconds: 25))) { // 25s 无数据=TimeoutException（M-067 看门狗）
+          .timeout(Duration(seconds: deepThink ? 120 : 25))) { // M-090：深思考首字可极慢看门狗放宽；常规仍 25s 防死链
         _chunkCount++;
         lineBuf += chunk;
         // SSE 事件按行分隔（data: {...}）；跨块的行缓冲在 lineBuf

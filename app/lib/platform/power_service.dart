@@ -23,4 +23,17 @@ class PowerService {
       await _ch.invokeMethod('requestIgnoreBatteryOptimizations');
     } catch (_) {}
   }
+
+  /// M-094：闹钟前台服务——通知栏常驻"闹钟已设"，系统不杀进程、Timer 不冻结
+  static Future<void> startAlarmGuard(String label) async {
+    try {
+      await _ch.invokeMethod('startAlarmForegroundService', {'label': label});
+    } catch (_) {}
+  }
+
+  static Future<void> stopAlarmGuard() async {
+    try {
+      await _ch.invokeMethod('stopAlarmForegroundService');
+    } catch (_) {}
+  }
 }

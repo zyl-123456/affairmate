@@ -3,6 +3,7 @@
 
 import 'package:flutter/material.dart';
 
+import '../app_state_scope.dart';
 import '../data/models.dart';
 import '../data/safe_io.dart';
 import '../state.dart';
@@ -16,6 +17,127 @@ class TimelinePage extends StatefulWidget {
 }
 
 class _TimelinePageState extends State<TimelinePage> {
+
+
+  /// M-096：人工写入状态弹窗（manual 标记与 AI 推断区分）
+  void _showManualStateEditor(BuildContext context) {
+    final app = InheritedAppState.of(context);
+    final bodyCtl = TextEditingController();
+    final cogCtl = TextEditingController();
+    final emoCtl = TextEditingController();
+    final motCtl = TextEditingController();
+    final noteCtl = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('人工写入今日状态', style: TextStyle(fontSize: 15)),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            _edField('身体（如：精力充沛/腰有点酸）', bodyCtl),
+            _edField('认知（如：头脑清晰/有点糊）', cogCtl),
+            _edField('情绪（如：平稳/有点烦）', emoCtl),
+            _edField('动机（如：想干活/提不起劲）', motCtl),
+            _edField('依据（可选，一句话）', noteCtl),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () {
+              final dims = {
+                'body': bodyCtl.text, 'cognition': cogCtl.text,
+                'emotion': emoCtl.text, 'motivation': motCtl.text,
+              };
+              var n = 0;
+              for (final e in dims.entries) {
+                if (e.value.trim().isNotEmpty) {
+                  app.manualWriteState(e.key, e.value.trim(), noteCtl.text.trim());
+                  n++;
+                }
+              }
+              Navigator.pop(ctx);
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('已人工写入 $n 维状态（带 ✍ 标记）')));
+              }
+            },
+            child: const Text('写入'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// M-096：事项全属性编辑器（人工通道——跟 AI 编辑并列，人也可以打字改）
+  void _showMatterEditor(BuildContext context, String id) {
+    final app = InheritedAppState.of(context);
+    final m = app.matters.firstWhere((x) => x.id == id,
+        orElse: () => app.matters.first);
+    final nameCtl = TextEditingController(text: m.name);
+    final timeCtl = TextEditingController(text: m.core.timeReq);
+    final energyCtl = TextEditingController(text: m.core.energyReq);
+    final masteryCtl = TextEditingController(text: m.core.mastery);
+    final stanceCtl = TextEditingController(text: (m.ext['stance'] ?? '').toString());
+    final progressCtl = TextEditingController(text: (m.ext['progress'] ?? '').toString());
+    final extraKeyCtl = TextEditingController();
+    final extraValCtl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: Text('编辑：\${m.name}', style: const TextStyle(fontSize: 15)),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              _edField('名称', nameCtl),
+              _edField('时间要求（如：每周3次/截止周五）', timeCtl),
+              _edField('精力要求（如：高专注/轻度）', energyCtl),
+              _edField('掌握度（familiar/average/unfamiliar）', masteryCtl),
+              _edField('我的态度认知（这事在我心里的地位）', stanceCtl),
+              _edField('当前进度（复杂事项的推进状态）', progressCtl),
+              const Divider(height: 20),
+              _edField('扩展键（新键名）', extraKeyCtl),
+              _edField('扩展值', extraValCtl),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            FilledButton(
+              onPressed: () {
+                app.manualEditMatter(id,
+                    name: nameCtl.text,
+                    core: {
+                      'time_req': timeCtl.text,
+                      'energy_req': energyCtl.text,
+                      'mastery': masteryCtl.text,
+                    },
+                    ext: {
+                      if (stanceCtl.text.trim().isNotEmpty) 'stance': stanceCtl.text,
+                      if (progressCtl.text.trim().isNotEmpty) 'progress': progressCtl.text,
+                      if (extraKeyCtl.text.trim().isNotEmpty && extraValCtl.text.trim().isNotEmpty)
+                        extraKeyCtl.text.trim(): extraValCtl.text.trim(),
+                    });
+                Navigator.pop(ctx);
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _edField(String label, TextEditingController ctl) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: TextField(
+          controller: ctl,
+          decoration: InputDecoration(
+              labelText: label, isDense: true,
+              border: const OutlineInputBorder()),
+          style: const TextStyle(fontSize: 13),
+        ),
+      );
+
   String? _viewingDate; // null=今天；否则回看历史某天（M-034）
   Map<String, dynamic> _allSchedule = {};
 
@@ -270,6 +392,13 @@ class _TimelinePageState extends State<TimelinePage> {
                     Text(
                         viewingToday ? '今日状态（四维电量）' : '$dateKey 的状态',
                         style: const TextStyle(fontWeight: FontWeight.w600)),
+                    const Spacer(),
+                    // M-096：人工写入状态（与 AI 写入区分，manual 标记）
+                    IconButton(
+                      icon: Icon(Icons.edit_note, size: 18, color: scheme.primary),
+                      tooltip: '人工写入',
+                      onPressed: () => _showManualStateEditor(context),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -354,6 +483,26 @@ class _TimelinePageState extends State<TimelinePage> {
                                   for (final line in _matterSubtitleLines(m))
                                     Text(line,
                                         style: const TextStyle(fontSize: 11, height: 1.6)),
+                                  // M-096：累计投入展示（时间条块自动累计+人工补记）
+                                  if (m.investLog.isNotEmpty) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      '⏱ 累计投入 ${_totalInvestHours(m)} 小时',
+                                      style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          color: scheme.primary),
+                                    ),
+                                    for (final l in m.investLog.take(8))
+                                      Text(
+                                          '　${l['date']} · ${l['hours']}h${(l['note'] ?? '').isNotEmpty && l['note'] != '时间条自动累计' ? ' · ${l['note']}' : ''}',
+                                          style: TextStyle(
+                                              fontSize: 10.5, color: scheme.outline)),
+                                    if (m.investLog.length > 8)
+                                      Text('　…共 ${m.investLog.length} 条记录',
+                                          style: TextStyle(
+                                              fontSize: 10, color: scheme.outline)),
+                                  ],
                                   const SizedBox(height: 4),
                                   Align(
                                     alignment: Alignment.centerRight,
@@ -415,6 +564,12 @@ class _TimelinePageState extends State<TimelinePage> {
               title: const Text('改名', style: TextStyle(fontSize: 13)),
               onTap: () => Navigator.pop(ctx, 'rename'),
             ),
+            // M-096：人工编辑全属性（名字/内核三属性/ext 键值——老大要求 AI 之外人也能改）
+            ListTile(
+              leading: const Icon(Icons.tune, size: 20),
+              title: const Text('编辑属性', style: TextStyle(fontSize: 13)),
+              onTap: () => Navigator.pop(ctx, 'editAll'),
+            ),
             ListTile(
               leading: const Icon(Icons.check_circle_outline, size: 20),
               title: const Text('归档（完成或搁置）', style: TextStyle(fontSize: 13)),
@@ -431,6 +586,9 @@ class _TimelinePageState extends State<TimelinePage> {
     );
     if (choice == null || !context.mounted) return;
     switch (choice) {
+      case 'editAll':
+        _showMatterEditor(context, id);
+        return;
       case 'rename':
         final c = TextEditingController(text: name);
         final v = await showDialog<String>(
@@ -712,6 +870,12 @@ class _TimelinePageState extends State<TimelinePage> {
 }
 
 /// 24 小时水平时间条：安排块着色 + 当前时间指示线
+/// M-096：事项累计投入小时数（investLog 汇总）
+double _totalInvestHours(Matter m) {
+  return m.investLog.fold<double>(
+      0, (sum, l) => sum + (double.tryParse(l['hours'] ?? '') ?? 0));
+}
+
 class TimeBar extends StatelessWidget {
   final List<ScheduleBlock> blocks;
   const TimeBar({super.key, required this.blocks});
@@ -762,6 +926,11 @@ class TimeBar extends StatelessWidget {
 
   /// UI-14（老大 18:14）：点击色块看详情——起点/终点/时长/标题/理由/并行轨
   void _showBlockDetail(BuildContext context, ScheduleBlock b) {
+    final app = InheritedAppState.of(context);
+    final now = DateTime.now();
+    final bDate = b.date.isNotEmpty
+        ? b.date
+        : '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     final dur = (b.endMinutes ?? 0) - (b.startMinutes ?? 0);
     final durStr = dur >= 60
         ? '${dur ~/ 60}小时${dur % 60 > 0 ? '${dur % 60}分' : ''}'
@@ -776,6 +945,12 @@ class TimeBar extends StatelessWidget {
           children: [
             Text('起止：${b.start} ~ ${b.end}（$durStr）',
                 style: const TextStyle(fontSize: 13)),
+            if (b.review.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text('你的回评：${b.review == 'done' ? '✓ 照做了' : (b.review == 'moved' ? '⏱ 改时间做了' : '✗ 没做')}',
+                    style: const TextStyle(fontSize: 12, color: Colors.green)),
+              ),
             if (b.isParallel)
               Padding(
                 padding: const EdgeInsets.only(top: 4),
@@ -790,6 +965,19 @@ class TimeBar extends StatelessWidget {
           ],
         ),
         actions: [
+          // M-089：安排效果回评——AI 排程的学习信号
+          TextButton(
+            onPressed: () { app.reviewBlock(bDate, b.start, b.matterRef, 'done'); Navigator.pop(ctx); },
+            child: const Text('✓照做', style: TextStyle(fontSize: 12)),
+          ),
+          TextButton(
+            onPressed: () { app.reviewBlock(bDate, b.start, b.matterRef, 'moved'); Navigator.pop(ctx); },
+            child: const Text('⏱改时做', style: TextStyle(fontSize: 12)),
+          ),
+          TextButton(
+            onPressed: () { app.reviewBlock(bDate, b.start, b.matterRef, 'skipped'); Navigator.pop(ctx); },
+            child: const Text('✗没做', style: TextStyle(fontSize: 12)),
+          ),
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('关闭')),
         ],
       ),

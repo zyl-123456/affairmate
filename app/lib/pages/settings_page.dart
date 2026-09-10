@@ -1,3 +1,4 @@
+import 'package:cross_file/cross_file.dart';
 // 设置页 · 多供应商 API 配置（REQ-008 / D-004）
 // Key 仅本地加密存储（SEC-002/004）；预设模板 + 自定义增删改
 
@@ -7,6 +8,9 @@ import 'dart:io';
 
 import '../data/backup.dart';
 import '../llm/providers.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import '../data/daily_snapshot.dart';
 import '../data/usage_log.dart';
 import '../llm/audio_store.dart';
 import '../state.dart';
@@ -267,6 +271,55 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 12),
 
+          // ============ 数据快照（M-087：每日全量冻结，永久保留，可导出电脑分析）============
+          Card(
+            elevation: 0,
+            color: scheme.surfaceContainerLow,
+            child: ListTile(
+              leading: Icon(Icons.photo_camera_back_outlined, size: 20, color: scheme.primary),
+              title: const Text('数据快照', style: TextStyle(fontSize: 14)),
+              subtitle: FutureBuilder<List<String>>(
+                future: DailySnapshot.availableDates(),
+                builder: (context, snap) => Text(
+                  snap.hasData
+                      ? '已存 ${snap.data!.length} 天 · 永久保留 · 点导出全部'
+                      : '每天 08:00 自动冻结一份数据全貌',
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ),
+              trailing: const Icon(Icons.ios_share_outlined, size: 18),
+              onTap: () async {
+                // 全部快照打包成一个 txt（JSON 数组形式——电脑端 AI 直接可读）
+                final dates = await DailySnapshot.availableDates();
+                if (dates.isEmpty) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('还没有快照——明天 8 点后自动生成第一份')));
+                  }
+                  return;
+                }
+                final doc = await getApplicationDocumentsDirectory();
+                final dir = Directory('${doc.path}${Platform.pathSeparator}snapshots');
+                final buf = StringBuffer('[');
+                for (final d in dates) {
+                  final f = File('${dir.path}${Platform.pathSeparator}daily_$d.json');
+                  if (f.existsSync()) {
+                    buf.writeln(f.readAsStringSync());
+                    buf.writeln(',');
+                  }
+                }
+                buf.writeln(']');
+                final out = File('${doc.path}${Platform.pathSeparator}exports${Platform.pathSeparator}snapshots_all_${dates.first}_${dates.last}.txt');
+                await out.create(recursive: true);
+                await out.writeAsString(buf.toString());
+                if (context.mounted) {
+                  await Share.shareXFiles([XFile(out.path)], text: '事务伴侣数据快照（${dates.length} 天）');
+                }
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+
           // ============ 使用日志（M-064：出问题时导出发给开发者）============
           Card(
             elevation: 0,
@@ -319,6 +372,17 @@ class _SettingsPageState extends State<SettingsPage> {
                       ),
                     ),
                     actions: [
+                      TextButton(
+                        onPressed: () async {
+                          final path = await UsageLog.exportToFile(
+                              (picked == null || picked == '__ALL__') ? null : picked);
+                          if (path != null && ctx.mounted) {
+                            Navigator.pop(ctx);
+                            await Share.shareXFiles([XFile(path)], text: '事务伴侣使用日志');
+                          }
+                        },
+                        child: const Text('导出文件'),
+                      ),
                       TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('关闭')),
                     ],
                   ),

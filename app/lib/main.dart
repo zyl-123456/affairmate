@@ -126,9 +126,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // M-060/080 晨报+闹钟触发：10 秒粒度轮询（原 1 分钟——老大要求误差<1 分钟）
     Timer.periodic(const Duration(seconds: 10), (_) {
       final app = InheritedAppState.maybeOf(context);
-      if (app != null && app.morningBriefDue && !app.sending) {
+      if (app == null) return;
+      if (app.morningBriefDue && !app.sending) {
         app.runMorningBrief();
       }
+      app.maybeDailySnapshot(); // M-087：每日 08:00 快照（内部自判已拍/未到点）
+      app.maybeDayEndSettle(); // M-096b：跨 0 点日终结算（结算昨天最终时间条）
     }); // 通知初始化（安卓）
     NotifyService.onTapNavigate = (mode) {
       // 点通知跳对应会话页（App 可能冷启动，navigate 回调在 build 后消费）
@@ -216,6 +219,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       );
       if (ok == true) {
         await PowerService.requestExempt();
+        // M-093：顺手查通知权限——第三防线（App被杀时系统通知兜底）
+        try {
+          final nEnabled = await NotifyService.notificationsEnabled();
+          if (!nEnabled) await NotifyService.requestNotifyPermission();
+        } catch (_) {}
         // 用户去点了设置——下次启动验证；这里先不写 flag，让验证生效后静默记录
       }
       // 无论这回点没点，下次启动再查（已豁免则静默记录不再弹）

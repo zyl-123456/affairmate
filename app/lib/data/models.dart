@@ -53,7 +53,8 @@ class Matter {
   final String name;
   final bool active; // on/off：off=已归档（完成或放弃）
   final CoreAttrs core; // 内核层三属性
-  final Map<String, dynamic> ext; // 扩展层开放键值（如 progress）
+  final Map<String, dynamic> ext; // 扩展层开放键值（如 progress/stance）
+  final List<Map<String, String>> investLog; // M-096 投入履历：[{date, hours, note}]——事项时间条块自动累计
   final String goalRef; // 所属目标 id（M-039：一事项一目标；空=未归目标）
   final String createdAt;
   final String updatedAt;
@@ -64,6 +65,7 @@ class Matter {
     this.active = true,
     this.core = const CoreAttrs(),
     this.ext = const {},
+    this.investLog = const [],
     this.goalRef = '',
     required this.createdAt,
     required this.updatedAt,
@@ -77,6 +79,10 @@ class Matter {
             ? CoreAttrs.fromJson(Map<String, dynamic>.from(j['core']))
             : const CoreAttrs(),
         ext: j['ext'] is Map ? Map<String, dynamic>.from(j['ext']) : {},
+        investLog: ((j['invest_log'] as List?) ?? [])
+            .whereType<Map>()
+            .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
+            .toList(growable: false),
         goalRef: (j['goal_ref'] ?? '').toString(),
         createdAt: (j['created_at'] ?? '').toString(),
         updatedAt: (j['updated_at'] ?? '').toString(),
@@ -88,6 +94,7 @@ class Matter {
         'active': active,
         'core': core.toJson(),
         'ext': ext,
+        if (investLog.isNotEmpty) 'invest_log': investLog,
         if (goalRef.isNotEmpty) 'goal_ref': goalRef,
         'created_at': createdAt,
         'updated_at': updatedAt,
@@ -599,6 +606,7 @@ class ScheduleBlock {
   final String reason; // 安排理由
   final int track; // 轨道号：0 主轨 / 1,2,3… 伴随轨（M-034）
   final String date; // YYYY-MM-DD（M-047 补录：空=今天）
+  final String review; // M-089 安排效果回评：''未评 / done照做 / moved改时做了 / skipped没做
 
   const ScheduleBlock({
     required this.start,
@@ -607,7 +615,14 @@ class ScheduleBlock {
     this.reason = '',
     this.track = 0,
     this.date = '',
+    this.review = '',
   });
+
+  ScheduleBlock copyWith({String? review}) => ScheduleBlock(
+        start: start, end: end, matterRef: matterRef,
+        reason: reason, track: track, date: date,
+        review: review ?? this.review,
+      );
 
   bool get isParallel => track > 0; // 伴随轨块（旧数据无 track 字段 → 0 → 主轨，兼容）
 
@@ -626,7 +641,8 @@ class ScheduleBlock {
         'matter_ref': matterRef,
         'reason': reason,
         if (track > 0) 'track': track, // 主轨不带字段（省空间+旧版兼容）
-        if (date.isNotEmpty) 'date': date, // M-047 补录：非今天的块带日期
+        if (date.isNotEmpty) 'date': date,
+        if (review.isNotEmpty) 'review': review, // M-089 // M-047 补录：非今天的块带日期
       };
 
   /// 起止分钟数（自 00:00 起）；解析失败返回 null
